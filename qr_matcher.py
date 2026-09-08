@@ -92,25 +92,36 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     products = []
 
     for i, line in enumerate(lines):
-        # Ищем номер отправления по шаблону (например: 0188337072-0248-1)
+        line_clean = line
+        
+        # 1. СНАЧАЛА ИЩЕМ НОМЕР ОТПРАВЛЕНИЯ (и удаляем его из строки, чтобы не путался с артикулом)
         m_order = re.search(r'\d{7,11}-\d{4}-\d{1,2}', line)
         if m_order:
             orders.append((i, m_order.group(0)))
+            line_clean = line_clean.replace(m_order.group(0), '')
             
-        # УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (ловит слитные, с дефисом, с подчеркиванием и классику с размерами)
-        m_sku = re.search(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', line)
+        # 2. УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (в очищенной строке)
+        m_sku = re.search(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', line_clean)
         if m_sku:
             sku_val = m_sku.group(1).replace(' ', '_')
             skus.append((i, sku_val))
             
-        # УНИВЕРСАЛЬНЫЙ ПОИСК ТОВАРА (очищаем строку от найденного артикула)
-        prod = line.replace('|', '').strip()
-        prod = re.sub(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', '', prod).strip()
+        # 3. ПОИСК И ОЧИСТКА НАЗВАНИЯ ТОВАРА
+        prod = line_clean.replace('|', '').strip()
+        if m_sku:
+            prod = prod.replace(m_sku.group(0), '').strip()
+            
+        # Убираем хвосты Ozon (Кол-во + Этикетка, например " 1 7116" в конце строки)
+        prod = re.sub(r'\s+\d+\s+\d{4}$', '', prod).strip()
+        # Убираем технический мусор (например, "1 -1" или "2 -2" в начале строки)
+        prod = re.sub(r'^[-_\s\d]+', '', prod).strip()
+        
+        # Если после всех чисток осталось осмысленное название (длиннее 2 букв)
         if prod and len(prod) > 2 and not prod.replace('.', '', 1).isdigit():
             if not re.match(r'^(шт|руб|\d+\s*шт|\d+\s*руб)$', prod, re.IGNORECASE):
                 products.append((i, prod))
 
-    # Связываем найденные артикулы с ближайшими заказами и товарами по строковому индексу
+    # Связываем найденные артикулы с ближайшими заказами и товарами по индексу строки
     records = []
     for sku_idx, sku_val in skus:
         closest_order = min(orders, key=lambda x: abs(x[0] - sku_idx)) if orders else (0, '')
