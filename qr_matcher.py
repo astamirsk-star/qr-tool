@@ -94,16 +94,18 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     for i, line in enumerate(lines):
         line_clean = line
         
-        # 1. СНАЧАЛА ИЩЕМ НОМЕР ОТПРАВЛЕНИЯ (и удаляем его из строки, чтобы не путался с артикулом)
+        # 1. СНАЧАЛА ИЩЕМ НОМЕР ОТПРАВЛЕНИЯ (и удаляем его из строки)
         m_order = re.search(r'\d{7,11}-\d{4}-\d{1,2}', line)
         if m_order:
             orders.append((i, m_order.group(0)))
             line_clean = line_clean.replace(m_order.group(0), '')
             
-        # 2. УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (в очищенной строке)
-        m_sku = re.search(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', line_clean)
+        # 2. УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (с захватом размеров в скобках)
+        m_sku = re.search(r'((?:\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2})(?:\s*\([^)]+\))?)', line_clean)
         if m_sku:
-            sku_val = m_sku.group(1).replace(' ', '_')
+            sku_val = m_sku.group(1).strip()
+            # Меняем пробел на подчеркивание только между цифрами (например "663 32" -> "663_32"), скобки не трогаем
+            sku_val = re.sub(r'(\d)\s+(\d)', r'\1_\2', sku_val)
             skus.append((i, sku_val))
             
         # 3. ПОИСК И ОЧИСТКА НАЗВАНИЯ ТОВАРА
@@ -144,9 +146,12 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
         df.index.name = '№'
     return df
 
+
 def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
-    """Сохраняет DataFrame в красивый Excel-файл с разметкой."""
+    """Сохраняет DataFrame в красивый Excel-файл с разметкой и добавляет лист со сводкой."""
     wb = openpyxl.Workbook()
+    
+    # --- ЛИСТ 1: ПОДРОБНЫЙ СПИСОК ЗАКАЗОВ ---
     ws = wb.active
     ws.title = "Заказы"
 
@@ -174,7 +179,7 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
     ws.column_dimensions['A'].width = 6
     ws.column_dimensions['B'].width = 22
     ws.column_dimensions['C'].width = 45
-    ws.column_dimensions['D'].width = 15
+    ws.column_dimensions['D'].width = 17
     ws.column_dimensions['E'].width = 10
     ws.column_dimensions['F'].width = 12
 
@@ -184,6 +189,46 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
             cell.alignment = openpyxl.styles.Alignment(vertical="center", horizontal="left" if cell.column == 3 else "center")
             if cell.row % 2 == 0:
                 cell.fill = openpyxl.styles.PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
+
+    # --- ЛИСТ 2: СВОДНАЯ ТАБЛИЦА (КАК НА ФОТО) ---
+    ws_summary = wb.create_sheet(title="Сводка")
+    
+    # Группируем данные: считаем сумму "Кол-во" по каждому уникальному "Артикулу"
+    summary_df = df.groupby('Артикул')['Кол-во'].sum().reset_index()
+    summary_df = summary_df.sort_values('Артикул') # Сортируем по алфавиту/цифрам
+    
+    # Заголовки сводной таблицы
+    ws_summary.append(['Названия строк', 'Сумма по полю Кол-во'])
+    
+    # Заполняем строки
+    total_qty = 0
+    for _, row in summary_df.iterrows():
+        ws_summary.append([row['Артикул'], row['Кол-во']])
+        total_qty += row['Кол-во']
+        
+    # Добавляем финальную строку с общим итогом
+    ws_summary.append(['Общий итог', total_qty])
+    
+    # Форматируем сводную таблицу (границы, выравнивание, цвет)
+    for col in range(1, 3):
+        cell = ws_summary.cell(row=1, column=col)
+        cell.font = openpyxl.styles.Font(bold=True)
+        cell.fill = openpyxl.styles.PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+        
+    last_row = ws_summary.max_row
+    for col in range(1, 3):
+        cell = ws_summary.cell(row=last_row, column=col)
+        cell.font = openpyxl.styles.Font(bold=True)
+        cell.fill = openpyxl.styles.PatternFill(start_color="A6A6A6", end_color="A6A6A6", fill_type="solid")
+
+    ws_summary.column_dimensions['A'].width = 25
+    ws_summary.column_dimensions['B'].width = 25
+    
+    for row in ws_summary.iter_rows(min_row=1, max_row=ws_summary.max_row, min_col=1, max_col=2):
+        for cell in row:
+            cell.border = thin_border
+            cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
 
     wb.save(output_path)
 
