@@ -16,16 +16,13 @@ jobs:
         python-version: '3.10'
 
     - name: Install dependencies
-      run: |
-        pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
+      run: pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
 
     - name: Build with PyInstaller
-      run: |
-        pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
+      run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
 
     - name: Upload EXE artifact
       uses: actions/upload-artifact@v3
       with:
         name: qr_matcher_exe
         path: dist/qr_matcher.exe
-        
