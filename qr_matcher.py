@@ -78,7 +78,7 @@ def process_all_pdfs(pdf_dir, output_dir, qrs_to_find, log_callback, progress_ca
 
 # --- ФУНКЦИИ ВТОРОЙ ВКЛАДКИ (ПАРСЕР OZON PDF) ---
 def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
-    """Извлекает текст из PDF и парсит любые заказы и товары Ozon в структурированную таблицу."""
+    """Извлекает текст из PDF и корректно парсит любые форматы артикулов, отправления и товары Ozon."""
     reader = PdfReader(pdf_path)
     full_text = ""
     for page in reader.pages:
@@ -97,15 +97,15 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
         if m_order:
             orders.append((i, m_order.group(0)))
             
-        # УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (любые артикулы, включая куртки и т.д.)
-        m_sku = re.search(r'([A-Za-z0-9А-Яа-я]{3}[ _]\d{2}(?:\s*\([^)]+\))?)', line)
+        # УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (ловит слитные, с дефисом, с подчеркиванием и классику с размерами)
+        m_sku = re.search(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', line)
         if m_sku:
             sku_val = m_sku.group(1).replace(' ', '_')
             skus.append((i, sku_val))
             
-        # УНИВЕРСАЛЬНЫЙ ПОИСК ТОВАРА (любое наименование)
+        # УНИВЕРСАЛЬНЫЙ ПОИСК ТОВАРА (очищаем строку от найденного артикула)
         prod = line.replace('|', '').strip()
-        prod = re.sub(r'[A-Za-z0-9А-Яа-я]{3}[ _]\d{2}(?:\s*\([^)]+\))?', '', prod).strip()
+        prod = re.sub(r'(\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2}(?:\s*\([^)]+\))?\b)', '', prod).strip()
         if prod and len(prod) > 2 and not prod.replace('.', '', 1).isdigit():
             if not re.match(r'^(шт|руб|\d+\s*шт|\d+\s*руб)$', prod, re.IGNORECASE):
                 products.append((i, prod))
@@ -163,7 +163,7 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
     ws.column_dimensions['A'].width = 6
     ws.column_dimensions['B'].width = 22
     ws.column_dimensions['C'].width = 45
-    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['D'].width = 15
     ws.column_dimensions['E'].width = 10
     ws.column_dimensions['F'].width = 12
 
