@@ -1,28 +1,18 @@
-name: Build EXE
+name: Build
 
 on: [push]
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-
-    - name: Install dependencies
-      run: pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
-
-    - name: Build with PyInstaller
-      run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
-
-    - name: Upload EXE artifact
-      uses: actions/upload-artifact@v3
+    - run: pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
+    - run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
+    - uses: actions/upload-artifact@v4
       with:
-        name: qr_matcher_exe
+        name: app
         path: dist/qr_matcher.exe
