@@ -11,8 +11,8 @@ jobs:
       with:
         python-version: '3.10'
     - run: pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
-    - run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
+    - run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl Barcode.py
     - uses: actions/upload-artifact@v4
       with:
         name: app
-        path: dist/qr_matcher.exe
+        path: dist/Barcode.exe
