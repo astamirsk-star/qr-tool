@@ -4,15 +4,15 @@ on: [push]
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2019
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.8'
     - run: pip install customtkinter pandas pymupdf openpyxl pypdf pyinstaller
-    - run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl Barcode.py
+    - run: pyinstaller --noconsole --onefile --hidden-import=pypdf --hidden-import=openpyxl qr_matcher.py
     - uses: actions/upload-artifact@v4
       with:
         name: app
-        path: dist/Barcode.exe
+        path: dist/Qr_matcher.exe
