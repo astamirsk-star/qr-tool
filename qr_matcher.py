@@ -6,7 +6,6 @@ import glob
 import pandas as pd
 import fitz
 import threading
-import time
 import openpyxl
 from pypdf import PdfReader
 
@@ -14,17 +13,188 @@ from pypdf import PdfReader
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("green")
 
-# --- ФУНКЦИИ ПЕРВОЙ ВКЛАДКИ (QR-СКАНЕР С ОБЩИМ PDF) ---
-def process_all_pdfs(pdf_dir, output_dir, qrs_to_find, log_callback, progress_callback):
+# --- ГЛАВНАЯ ФУНКЦИЯ ПРОЦЕССА СВЕРКИ, СОРТИРОВКИ PDF И 1С (ВКЛАДКА 1) ---
+def process_full_workflow(scans_excel_path, pdf_dir, output_dir, check_excel_path, log_callback, progress_callback):
+    
+    def clean_val(v):
+        if pd.isna(v): return ""
+        s = str(v)
+        s = re.sub(r'[\s\xa0\u200b\ufeff]', '', s)
+        if s.endswith('.0'): s = s[:-2]
+        if s.lower() == 'nan': return ""
+        return s
+
+    def fix_layout(s):
+        if not re.search(r'[а-яА-ЯёЁ]', s):
+            return s
+        ru_chars = 'йцукенгшщзхъфывапролджэячсмитьбюЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮёЁ"№;:?,.'
+        en_chars = 'qwertyuiop[]asdfghjkl;\'zxcvbnm,.QWERTYUIOP{}ASDFGHJKL:"ZXCVBNM<>`~@#$^&?/'
+        return s.translate(str.maketrans(ru_chars, en_chars))
+
+    # 1. Загружаем справочник
+    map_gtin = {}
+    map_common = {}
+    map_ozn = {}
+    
+    if check_excel_path and os.path.exists(check_excel_path):
+        log_callback(f"Загружаем справочник: {os.path.basename(check_excel_path)}")
+        try:
+            df_db_raw = pd.read_excel(check_excel_path, sheet_name=0, header=None, dtype=str)
+            df_db = df_db_raw.copy()
+            
+            rename_dict = {}
+            if 0 in df_db.columns: rename_dict[0] = 'Seller_Art'
+            if 1 in df_db.columns: rename_dict[1] = 'WB_Art'
+            if 4 in df_db.columns: rename_dict[4] = 'GTIN'
+            if 7 in df_db.columns: rename_dict[7] = 'Barcode_Common'
+            if 8 in df_db.columns: rename_dict[8] = 'Ozon_Art'
+            if 10 in df_db.columns: rename_dict[10] = 'Name'
+            if 11 in df_db.columns: rename_dict[11] = 'SK_2'
+            
+            df_db = df_db.rename(columns=rename_dict)
+            
+            for _, row in df_db.iterrows():
+                b_common = clean_val(row.get('Barcode_Common', ''))
+                gtin = clean_val(row.get('GTIN', ''))
+                if gtin and len(gtin) in [13, 14]:
+                    gtin = gtin.zfill(14)
+                ozn = clean_val(row.get('SK_2', ''))
+                
+                info = {
+                    'barcode_common': b_common,
+                    'gtin': gtin,
+                    'seller_art': clean_val(row.get('Seller_Art', '')),
+                    'wb_art': clean_val(row.get('WB_Art', '')),
+                    'ozon_art': clean_val(row.get('Ozon_Art', '')),
+                    'name': clean_val(row.get('Name', '')),
+                    'sk_2': ozn
+                }
+                if b_common: map_common[b_common] = info
+                if gtin: map_gtin[gtin] = info
+                if ozn: map_ozn[ozn] = info
+            log_callback("Справочник успешно загружен.")
+        except Exception as e:
+            log_callback(f"Ошибка при чтении файла сверки: {e}")
+
+    # 2. Читаем отсканированные данные
+    log_callback("Чтение файла с отсканированными данными...")
+    scanned_sequence = []
+    if scans_excel_path and os.path.exists(scans_excel_path):
+        try:
+            xls_scans = pd.read_excel(scans_excel_path, sheet_name=None, header=None, dtype=str)
+            for _, s_df in xls_scans.items():
+                for _, row in s_df.iterrows():
+                    for val in row.dropna():
+                        v_str = clean_val(val)
+                        if v_str:
+                            v_str = fix_layout(v_str)
+                            scanned_sequence.append(v_str)
+            log_callback(f"Считано {len(scanned_sequence)} записей из файла сканов.")
+        except Exception as e:
+            log_callback(f"Ошибка при чтении файла сканов: {e}")
+
+    # 2.5 Группируем сканы в пары
+    paired_scans = []
+    temp_pair = {'kiz': "", 'barcode': ""}
+    
+    for token in scanned_sequence:
+        clean_t = re.sub(r'\s+', '', token).replace('(01)', '01').replace('(21)', '21')
+        is_kiz = bool(re.search(r'01\d{14}21', clean_t))
+        
+        if is_kiz:
+            if temp_pair['kiz']: 
+                paired_scans.append(temp_pair)
+                temp_pair = {'kiz': "", 'barcode': ""}
+            temp_pair['kiz'] = clean_t
+        else:
+            if temp_pair['barcode']: 
+                paired_scans.append(temp_pair)
+                temp_pair = {'kiz': "", 'barcode': ""}
+            temp_pair['barcode'] = clean_t
+            
+        if temp_pair['kiz'] and temp_pair['barcode']:
+            paired_scans.append(temp_pair)
+            temp_pair = {'kiz': "", 'barcode': ""}
+            
+    if temp_pair['kiz'] or temp_pair['barcode']:
+        paired_scans.append(temp_pair)
+
+    log_callback(f"Сформировано пар (КИЗ + Баркод) из сканов: {len(paired_scans)}")
+
+    # 2.6 ЖЕЛЕЗНАЯ ЛОГИКА ПОИСКА
+    records_for_1c = []
+    lost_items = []
+    
+    pdf_kiz_masks = {} 
+    matched_for_1c = 0
+
+    for pair in paired_scans:
+        s_kiz = pair['kiz']
+        s_bar = pair['barcode']
+        
+        info = None
+        lookup_gtin = ""
+        short_serial = ""
+        
+        if s_kiz:
+            m = re.search(r'01(\d{14})21(.{1,15})', s_kiz)
+            if m:
+                lookup_gtin = m.group(1)
+                serial_raw = m.group(2)[:13]
+                serial_clean = re.sub(r'[^a-zA-Z0-9]', '', serial_raw).lower()
+                short_serial = serial_clean[:6] 
+                
+                if lookup_gtin not in pdf_kiz_masks:
+                    pdf_kiz_masks[lookup_gtin] = []
+                pdf_kiz_masks[lookup_gtin].append(short_serial)
+                
+        if s_bar in map_common: info = map_common[s_bar]
+        elif s_bar in map_gtin: info = map_gtin[s_bar]
+        elif s_bar.zfill(14) in map_gtin: info = map_gtin[s_bar.zfill(14)]
+        elif s_bar in map_ozn: info = map_ozn[s_bar]
+        elif lookup_gtin in map_gtin: info = map_gtin[lookup_gtin]
+            
+        if info:
+            b_common = info['barcode_common'] if info['barcode_common'] else "НЕТ ОБЩЕГО БАРКОДА В БАЗЕ"
+            
+            records_for_1c.append({
+                'Отсканированный ШК': s_bar if s_bar else "НЕТ",
+                'Баркод общий (для 1С)': b_common,
+                'ШК 2 (Ozon)': info['sk_2'],
+                'КИЗ (Честный ЗНАК)': s_kiz,
+                'Артикул продавца': info['seller_art'],
+                'Артикул WB': info['wb_art'],
+                'Артикул Ozon': info['ozon_art'],
+                'Наименование товара': info['name'],
+                'Количество': 1,
+                'no_kiz': not bool(s_kiz),
+                'no_barcode': not bool(s_bar)
+            })
+            matched_for_1c += 1
+        else:
+            lost_items.append({
+                'Причина': 'Не найден в базе (Справочнике)',
+                'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
+                'Детали': s_kiz
+            })
+
+    log_callback(f"Успешно сопоставлено для 1С: {matched_for_1c} из {len(paired_scans)} пар")
+    
+    total_kizs = sum(len(v) for v in pdf_kiz_masks.values())
+    log_callback(f"Строгих уникальных КИЗов для вырезки из PDF: {total_kizs} шт.")
+    log_callback("Начинаем сканирование и сортировку PDF-файлов...\n")
+
+    # 3. Сканируем PDF-файлы
     pdf_files = glob.glob(os.path.join(pdf_dir, '*.pdf'))
     pdf_files = [f for f in pdf_files if not os.path.basename(f).startswith('Matched_') and not os.path.basename(f).startswith('All_Matched_')]
     
-    total_matched_pages = 0
-    processed_files_count = 0
-    found_qrs = set() 
+    doc_male = fitz.open()
+    doc_female = fitz.open()
+    doc_other = fitz.open()
     
-    # Создаем общий документ для объединения всех найденных страниц
-    master_doc = fitz.open()
+    male_count = 0
+    female_count = 0
+    other_count = 0
     
     for i, pdf_path in enumerate(pdf_files):
         filename = os.path.basename(pdf_path)
@@ -36,49 +206,166 @@ def process_all_pdfs(pdf_dir, output_dir, qrs_to_find, log_callback, progress_ca
             file_matched_count = 0
             
             for page_num in range(len(doc)):
+                if sum(len(v) for v in pdf_kiz_masks.values()) == 0:
+                    break 
+                    
                 page = doc[page_num]
-                text = page.get_text()
-                if text:
-                    clean_text = re.sub(r'\s+', '', text)
-                    for qr in qrs_to_find:
-                        clean_qr = re.sub(r'\s+', '', qr)
-                        if clean_qr in clean_text:
-                            # Добавляем страницу в индивидуальный файл
-                            new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                            # И сразу добавляем эту же страницу в общий мастер-документ
-                            master_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                            
-                            file_matched_count += 1
-                            total_matched_pages += 1
-                            found_qrs.add(qr) 
+                raw_text = page.get_text()
+                clean_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text).lower()
+                
+                is_match = False
+                
+                for target_gtin, serials in pdf_kiz_masks.items():
+                    if target_gtin.lower() in clean_text:
+                        matched_serial = None
+                        for serial in serials:
+                            if serial in clean_text:
+                                is_match = True
+                                matched_serial = serial
+                                break
+                        if matched_serial:
+                            serials.remove(matched_serial)
                             break
+                            
+                if is_match:
+                    new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                    
+                    text_lower = raw_text.lower()
+                    file_lower = filename.lower()
+                    
+                    if 'женск' in text_lower or 'жен.' in text_lower or 'w-' in text_lower or 'женск' in file_lower:
+                        doc_female.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        female_count += 1
+                    elif 'мужск' in text_lower or 'муж.' in text_lower or 'мужск' in file_lower:
+                        doc_male.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        male_count += 1
+                    else:
+                        doc_other.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        other_count += 1
+                        
+                    file_matched_count += 1
                             
             if file_matched_count > 0:
                 output_filename = f'Matched_{filename}'
-                output_path = os.path.join(output_dir, output_filename)
-                new_doc.save(output_path)
-                log_callback(f"Успех! Найдено {file_matched_count} стр. -> Сохранен как: {output_filename}")
-                processed_files_count += 1
+                new_doc.save(os.path.join(output_dir, output_filename))
+                log_callback(f"Успех! Извлечено {file_matched_count} нужных стр. из файла {filename}")
                 
             new_doc.close()
             doc.close()
                 
         except Exception as e:
-            log_callback(f"Ошибка при чтении файла {filename}: {e}")
+            log_callback(f"Ошибка в файле {filename}: {e}")
             
-    # Сохраняем общий сводный PDF, если набрались страницы
-    if total_matched_pages > 0:
-        all_pdf_path = os.path.join(output_dir, "All_Matched_Report.pdf")
-        master_doc.save(all_pdf_path)
-        log_callback(f"\n[ИТОГ] Создан общий файл со всеми найденными страницами: All_Matched_Report.pdf")
+    if male_count > 0:
+        doc_male.save(os.path.join(output_dir, "All_Matched_Мужские.pdf"))
+        log_callback(f"\n[PDF ИТОГ] Мужские этикетки ({male_count} стр.) -> All_Matched_Мужские.pdf")
+    if female_count > 0:
+        doc_female.save(os.path.join(output_dir, "All_Matched_Женские.pdf"))
+        log_callback(f"[PDF ИТОГ] Женские этикетки ({female_count} стр.) -> All_Matched_Женские.pdf")
+    if other_count > 0:
+        doc_other.save(os.path.join(output_dir, "All_Matched_Неопределенные.pdf"))
+        log_callback(f"[PDF ИТОГ] Неопределенные ({other_count} стр.) -> All_Matched_Неопределенные.pdf")
         
-    master_doc.close()
-    return total_matched_pages, processed_files_count, found_qrs
+    doc_male.close()
+    doc_female.close()
+    doc_other.close()
+
+    for target_gtin, serials in pdf_kiz_masks.items():
+        for serial in serials:
+            lost_items.append({
+                'Причина': 'Не найдена этикетка в PDF (КИЗ)',
+                'Штрихкод / GTIN': target_gtin,
+                'Детали': f"Хвост серийника: {serial}"
+            })
+
+    # 4. Генерируем файл для 1С И ВКЛАДКУ ПОТЕРЯШЕК
+    if check_excel_path and (records_for_1c or lost_items):
+        output_1c = os.path.join(output_dir, "For_1C_Upload.xlsx")
+        wb_1c = openpyxl.Workbook()
+        
+        ws1 = wb_1c.active
+        ws1.title = "Детализированный"
+        ws1.append(['Отсканированный ШК', 'Баркод общий (для 1С)', 'ШК 2 (Ozon)', 'КИЗ (Честный ЗНАК)', 'Артикул продавца', 'Артикул WB', 'Артикул Ozon', 'Наименование товара', 'Количество'])
+        
+        fill_no_kiz = openpyxl.styles.PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+        fill_no_barcode = openpyxl.styles.PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
+        
+        for i, item in enumerate(records_for_1c, start=2):
+            ws1.append([
+                item['Отсканированный ШК'], item['Баркод общий (для 1С)'], item['ШК 2 (Ozon)'], 
+                item['КИЗ (Честный ЗНАК)'], item['Артикул продавца'], item['Артикул WB'], 
+                item['Артикул Ozon'], item['Наименование товара'], 1
+            ])
+            # Подсветка: Красный - нет баркода. Желтый - нет КИЗа.
+            if item.get('no_barcode'):
+                for col in range(1, 10):
+                    ws1.cell(row=i, column=col).fill = fill_no_barcode
+            elif item.get('no_kiz'):
+                for col in range(1, 10):
+                    ws1.cell(row=i, column=col).fill = fill_no_kiz
+            
+        ws2 = wb_1c.create_sheet(title="Для загрузки в 1С")
+        ws2.append(['Штрихкод', 'Количество'])
+        
+        if records_for_1c:
+            df_det = pd.DataFrame(records_for_1c)
+            # ФИЛЬТР: В 1С идут ТОЛЬКО те, где был физически отсканирован баркод, и есть общий баркод в базе!
+            df_valid = df_det[(df_det['no_barcode'] == False) & (df_det['Баркод общий (для 1С)'] != "НЕТ ОБЩЕГО БАРКОДА В БАЗЕ")]
+            if not df_valid.empty:
+                df_summary = df_valid.groupby('Баркод общий (для 1С)')['Количество'].sum().reset_index()
+                for _, row in df_summary.iterrows():
+                    ws2.append([row['Баркод общий (для 1С)'], row['Количество']])
+
+        ws3 = wb_1c.create_sheet(title="Потеряшки")
+        ws3.append(['Причина', 'Штрихкод / GTIN', 'Детали'])
+        for item in lost_items:
+            ws3.append([item['Причина'], item['Штрихкод / GTIN'], item['Детали']])
+            
+        header_fill = openpyxl.styles.PatternFill(start_color="3B5998", end_color="3B5998", fill_type="solid")
+        header_font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        thin_border = openpyxl.styles.Border(
+            left=openpyxl.styles.Side(style='thin', color="DDDDDD"), 
+            right=openpyxl.styles.Side(style='thin', color="DDDDDD"), 
+            top=openpyxl.styles.Side(style='thin', color="DDDDDD"), 
+            bottom=openpyxl.styles.Side(style='thin', color="DDDDDD")
+        )
+        
+        for ws in [ws1, ws2, ws3]:
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row=1, column=col)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                for cell in row:
+                    cell.border = thin_border
+                    cell.alignment = openpyxl.styles.Alignment(vertical="center", horizontal="left" if cell.column >= 3 else "center")
+
+        ws1.column_dimensions['A'].width = 22
+        ws1.column_dimensions['B'].width = 22
+        ws1.column_dimensions['C'].width = 18
+        ws1.column_dimensions['D'].width = 38
+        ws1.column_dimensions['E'].width = 16
+        ws1.column_dimensions['F'].width = 16
+        ws1.column_dimensions['G'].width = 16
+        ws1.column_dimensions['H'].width = 45
+        ws1.column_dimensions['I'].width = 12
+        
+        ws2.column_dimensions['A'].width = 22
+        ws2.column_dimensions['B'].width = 15
+        
+        ws3.column_dimensions['A'].width = 35
+        ws3.column_dimensions['B'].width = 25
+        ws3.column_dimensions['C'].width = 40
+
+        wb_1c.save(output_1c)
+        log_callback(f"\n[1С ИТОГ] Отчет сохранен (в т.ч. Потеряшки: {len(lost_items)} шт):\n{output_1c}")
+    elif check_excel_path:
+        log_callback("\n[1С ИТОГ] Справочник выбран, но ничего не найдено.")
 
 
 # --- ФУНКЦИИ ВТОРОЙ ВКЛАДКИ (ПАРСЕР OZON PDF) ---
 def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
-    """Извлекает текст из PDF и корректно парсит любые форматы артикулов, отправления и товары Ozon."""
     reader = PdfReader(pdf_path)
     full_text = ""
     for page in reader.pages:
@@ -91,39 +378,34 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     orders = []
     products = []
 
+    regex_sku = r'((?:(?:[A-Za-z]+[-_])?\d+[-_]\d+(?:/\d+)?|(?:[A-Za-z]+[-_]?)?\d+[\s-]*\(\d+-\d+\)[ _-]\d+|\b\d{5,9}\b|\b\d{3}[ _]\d{2}(?:/\d+)?)(?:\s*\([^)]+\))?)'
+
     for i, line in enumerate(lines):
         line_clean = line
+        line_clean = re.sub(r'\b([A-Za-z0-9\-]*(\d))\s+\2_(\d+)\s+\3\b', r'\1_\3', line_clean)
         
-        # 1. СНАЧАЛА ИЩЕМ НОМЕР ОТПРАВЛЕНИЯ (и удаляем его из строки)
-        m_order = re.search(r'\d{7,11}-\d{4}-\d{1,2}', line)
+        m_order = re.search(r'\d{6,15}-\d{4}-\d{1,3}', line_clean)
         if m_order:
             orders.append((i, m_order.group(0)))
             line_clean = line_clean.replace(m_order.group(0), '')
             
-        # 2. УНИВЕРСАЛЬНЫЙ ПОИСК АРТИКУЛА (с захватом размеров в скобках)
-        m_sku = re.search(r'((?:\b\d+[_-]\d+\b|\b\d{5,}\b|\b\d{3}[ _]\d{2})(?:\s*\([^)]+\))?)', line_clean)
+        m_sku = re.search(regex_sku, line_clean)
         if m_sku:
             sku_val = m_sku.group(1).strip()
-            # Меняем пробел на подчеркивание только между цифрами (например "663 32" -> "663_32"), скобки не трогаем
             sku_val = re.sub(r'(\d)\s+(\d)', r'\1_\2', sku_val)
             skus.append((i, sku_val))
             
-        # 3. ПОИСК И ОЧИСТКА НАЗВАНИЯ ТОВАРА
         prod = line_clean.replace('|', '').strip()
         if m_sku:
             prod = prod.replace(m_sku.group(0), '').strip()
             
-        # Убираем хвосты Ozon (Кол-во + Этикетка, например " 1 7116" в конце строки)
         prod = re.sub(r'\s+\d+\s+\d{4}$', '', prod).strip()
-        # Убираем технический мусор (например, "1 -1" или "2 -2" в начале строки)
         prod = re.sub(r'^[-_\s\d]+', '', prod).strip()
         
-        # Если после всех чисток осталось осмысленное название (длиннее 2 букв)
         if prod and len(prod) > 2 and not prod.replace('.', '', 1).isdigit():
             if not re.match(r'^(шт|руб|\d+\s*шт|\d+\s*руб)$', prod, re.IGNORECASE):
                 products.append((i, prod))
 
-    # Связываем найденные артикулы с ближайшими заказами и товарами по индексу строки
     records = []
     for sku_idx, sku_val in skus:
         closest_order = min(orders, key=lambda x: abs(x[0] - sku_idx)) if orders else (0, '')
@@ -148,13 +430,9 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
 
 
 def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
-    """Сохраняет DataFrame в красивый Excel-файл с разметкой и добавляет лист со сводкой."""
     wb = openpyxl.Workbook()
-    
-    # --- ЛИСТ 1: ПОДРОБНЫЙ СПИСОК ЗАКАЗОВ ---
     ws = wb.active
     ws.title = "Заказы"
-
     headers = ['№', 'Номер отправления', 'Товар', 'Артикул', 'Кол-во', 'Этикетка']
     ws.append(headers)
 
@@ -179,7 +457,7 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
     ws.column_dimensions['A'].width = 6
     ws.column_dimensions['B'].width = 22
     ws.column_dimensions['C'].width = 45
-    ws.column_dimensions['D'].width = 17
+    ws.column_dimensions['D'].width = 19
     ws.column_dimensions['E'].width = 10
     ws.column_dimensions['F'].width = 12
 
@@ -190,26 +468,19 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
             if cell.row % 2 == 0:
                 cell.fill = openpyxl.styles.PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
 
-    # --- ЛИСТ 2: СВОДНАЯ ТАБЛИЦА (КАК НА ФОТО) ---
     ws_summary = wb.create_sheet(title="Сводка")
-    
-    # Группируем данные: считаем сумму "Кол-во" по каждому уникальному "Артикулу"
     summary_df = df.groupby('Артикул')['Кол-во'].sum().reset_index()
-    summary_df = summary_df.sort_values('Артикул') # Сортируем по алфавиту/цифрам
+    summary_df = summary_df.sort_values('Артикул')
     
-    # Заголовки сводной таблицы
     ws_summary.append(['Названия строк', 'Сумма по полю Кол-во'])
     
-    # Заполняем строки
     total_qty = 0
     for _, row in summary_df.iterrows():
         ws_summary.append([row['Артикул'], row['Кол-во']])
         total_qty += row['Кол-во']
         
-    # Добавляем финальную строку с общим итогом
     ws_summary.append(['Общий итог', total_qty])
     
-    # Форматируем сводную таблицу (границы, выравнивание, цвет)
     for col in range(1, 3):
         cell = ws_summary.cell(row=1, column=col)
         cell.font = openpyxl.styles.Font(bold=True)
@@ -233,78 +504,90 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
     wb.save(output_path)
 
 
-# --- ГЛАВНОЕ ОКНО ПРИЛОЖЕНИЯ С ВКЛАДКАМИ ---
+# --- ГЛАВНОЕ ОКНО ПРИЛОЖЕНИЯ ---
 class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("Инструменты логистики")
-        self.geometry("850x850")
+        self.geometry("850x880")
 
-        self.tabview = ctk.CTkTabview(self, width=810, height=810)
+        self.tabview = ctk.CTkTabview(self, width=810, height=830)
         self.tabview.pack(padx=20, pady=20, fill="both", expand=True)
 
-        self.tab_qr = self.tabview.add("Сверка QR-кодов")
+        self.tab_qr = self.tabview.add("Сверка и 1С")
         self.tab_ozon = self.tabview.add("Парсер Ozon PDF")
+        self.tab_split = self.tabview.add("Разделение папки PDF")
 
         self.init_qr_tab()
         self.init_ozon_tab()
+        self.init_split_tab()
 
-    # --- ИНТЕРФЕЙС ВКЛАДКИ 1 (QR) ---
     def init_qr_tab(self):
-        header = ctk.CTkLabel(self.tab_qr, text="Сверка QR-кодов по PDF", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
+        header = ctk.CTkLabel(self.tab_qr, text="Обработка сканов, PDF и генерация 1С", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
         header.pack(pady=(10, 15))
 
         files_frame = ctk.CTkFrame(self.tab_qr, fg_color="transparent")
         files_frame.pack(fill="x", padx=10, pady=5)
 
-        self.btn_excel = ctk.CTkButton(files_frame, text="Выбрать Excel", width=150, command=self.pick_excel)
-        self.btn_excel.grid(row=0, column=0, padx=(0, 10), pady=10)
-        self.entry_excel = ctk.CTkEntry(files_frame, placeholder_text="Файл Excel не выбран", width=570)
-        self.entry_excel.grid(row=0, column=1, pady=10)
+        self.btn_scans = ctk.CTkButton(files_frame, text="Отсканированные", width=160, command=self.pick_scans_file)
+        self.btn_scans.grid(row=0, column=0, padx=(0, 10), pady=8)
+        self.entry_scans = ctk.CTkEntry(files_frame, placeholder_text="Файл с отсканированными данными не выбран", width=560)
+        self.entry_scans.grid(row=0, column=1, pady=8)
 
-        self.btn_pdf_in = ctk.CTkButton(files_frame, text="Исходные PDF", width=150, command=self.pick_pdf_in)
-        self.btn_pdf_in.grid(row=1, column=0, padx=(0, 10), pady=10)
-        self.entry_pdf_in = ctk.CTkEntry(files_frame, placeholder_text="Папка с исходными PDF не выбрана", width=570)
-        self.entry_pdf_in.grid(row=1, column=1, pady=10)
+        self.btn_pdf_in = ctk.CTkButton(files_frame, text="Исходные PDF", width=160, command=self.pick_pdf_in)
+        self.btn_pdf_in.grid(row=1, column=0, padx=(0, 10), pady=8)
+        self.entry_pdf_in = ctk.CTkEntry(files_frame, placeholder_text="Папка с исходными PDF не выбрана", width=560)
+        self.entry_pdf_in.grid(row=1, column=1, pady=8)
 
-        self.btn_pdf_out = ctk.CTkButton(files_frame, text="Куда сохранить?", width=150, command=self.pick_pdf_out)
-        self.btn_pdf_out.grid(row=2, column=0, padx=(0, 10), pady=10)
-        self.entry_pdf_out = ctk.CTkEntry(files_frame, placeholder_text="Папка для сохранения не выбрана", width=570)
-        self.entry_pdf_out.grid(row=2, column=1, pady=10)
+        self.btn_check = ctk.CTkButton(files_frame, text="Файл для сверки", width=160, command=self.pick_check_file)
+        self.btn_check.grid(row=2, column=0, padx=(0, 10), pady=8)
+        self.entry_check = ctk.CTkEntry(files_frame, placeholder_text="Файл справочника базы (необязательно)", width=560)
+        self.entry_check.grid(row=2, column=1, pady=8)
 
-        self.btn_start = ctk.CTkButton(self.tab_qr, text="Запустить сверку", height=42, width=250, font=ctk.CTkFont(size=15), command=self.start_qr_processing)
-        self.btn_start.pack(pady=15)
+        self.btn_pdf_out = ctk.CTkButton(files_frame, text="Куда сохранить?", width=160, command=self.pick_pdf_out)
+        self.btn_pdf_out.grid(row=3, column=0, padx=(0, 10), pady=8)
+        self.entry_pdf_out = ctk.CTkEntry(files_frame, placeholder_text="Папка для сохранения результатов не выбрана", width=560)
+        self.entry_pdf_out.grid(row=3, column=1, pady=8)
+
+        self.btn_start = ctk.CTkButton(self.tab_qr, text="Запустить обработку", height=42, width=280, font=ctk.CTkFont(size=15), command=self.start_qr_processing)
+        self.btn_start.pack(pady=12)
 
         self.lbl_stage = ctk.CTkLabel(self.tab_qr, text="Стадия: Готово к работе", text_color="#ffcc00", font=ctk.CTkFont(weight="bold"))
-        self.lbl_stage.pack(pady=5)
+        self.lbl_stage.pack(pady=3)
 
         self.progress_bar = ctk.CTkProgressBar(self.tab_qr, width=400)
         self.progress_bar.set(0)
-        self.progress_bar.pack(pady=(5, 0))
+        self.progress_bar.pack(pady=(3, 0))
         self.progress_bar.pack_forget()
 
         self.lbl_progress = ctk.CTkLabel(self.tab_qr, text="")
-        self.lbl_progress.pack(pady=(0, 5))
+        self.lbl_progress.pack(pady=(0, 3))
         self.lbl_progress.pack_forget()
 
-        self.textbox_qr = ctk.CTkTextbox(self.tab_qr, width=750, height=270, fg_color="#1e1e1e")
-        self.textbox_qr.pack(padx=10, pady=10, fill="both", expand=True)
+        self.textbox_qr = ctk.CTkTextbox(self.tab_qr, width=750, height=230, fg_color="#1e1e1e")
+        self.textbox_qr.pack(padx=10, pady=5, fill="both", expand=True)
 
-    def pick_excel(self):
-        filepath = filedialog.askopenfilename(title="Выберите Excel файл", filetypes=[("Excel", "*.xlsx *.xls")])
+    def pick_scans_file(self):
+        filepath = filedialog.askopenfilename(title="Выберите файл сканов", filetypes=[("Excel", "*.xlsx *.xls")])
         if filepath:
-            self.entry_excel.delete(0, 'end')
-            self.entry_excel.insert(0, filepath)
+            self.entry_scans.delete(0, 'end')
+            self.entry_scans.insert(0, filepath)
 
     def pick_pdf_in(self):
-        dirpath = filedialog.askdirectory(title="Выберите папку с исходными PDF")
+        dirpath = filedialog.askdirectory(title="Выберите папку PDF")
         if dirpath:
             self.entry_pdf_in.delete(0, 'end')
             self.entry_pdf_in.insert(0, dirpath)
 
+    def pick_check_file(self):
+        filepath = filedialog.askopenfilename(title="Выберите базу (справочник)", filetypes=[("Excel", "*.xlsx *.xls")])
+        if filepath:
+            self.entry_check.delete(0, 'end')
+            self.entry_check.insert(0, filepath)
+
     def pick_pdf_out(self):
-        dirpath = filedialog.askdirectory(title="Выберите папку для сохранения результатов")
+        dirpath = filedialog.askdirectory(title="Папка для сохранения")
         if dirpath:
             self.entry_pdf_out.delete(0, 'end')
             self.entry_pdf_out.insert(0, dirpath)
@@ -327,76 +610,31 @@ class MainApp(ctk.CTk):
         self.after(0, update)
 
     def start_qr_processing(self):
-        excel_path = self.entry_excel.get()
+        scans_path = self.entry_scans.get()
         pdf_in = self.entry_pdf_in.get()
+        check_path = self.entry_check.get()
         pdf_out = self.entry_pdf_out.get()
 
-        if not excel_path or not pdf_in or not pdf_out:
-            self.safe_stage_qr("Ошибка: Заполните все поля путей!")
+        if not scans_path or not pdf_in or not pdf_out:
+            self.safe_stage_qr("Ошибка: Заполните обязательные поля!")
             return
 
         self.btn_start.configure(state="disabled")
-        self.progress_bar.pack(pady=(5, 0))
-        self.lbl_progress.pack(pady=(0, 5))
+        self.progress_bar.pack(pady=(3, 0))
+        self.lbl_progress.pack(pady=(0, 3))
         self.progress_bar.set(0)
         self.textbox_qr.delete("1.0", "end")
 
-        threading.Thread(target=self.run_qr_script, args=(excel_path, pdf_in, pdf_out), daemon=True).start()
+        threading.Thread(target=self.run_full_script, args=(scans_path, pdf_in, pdf_out, check_path), daemon=True).start()
 
-    def run_qr_script(self, current_excel, current_pdf_dir, current_output_dir):
-        self.safe_stage_qr("Чтение Excel...")
-        self.safe_log_qr("Начинаем сверку QR-кодов...")
+    def run_full_script(self, scans_path, current_pdf_dir, current_output_dir, check_path):
+        self.safe_stage_qr("Выполнение процесса...")
+        self.safe_log_qr("Запуск обработки...")
         try:
-            qrs_to_find = set()
-            xls = pd.read_excel(current_excel, sheet_name=None, header=None)
-            pattern = re.compile(r'(01\d{14}21.{13})')
-            
-            for sheet_name, df in xls.items():
-                for _, row in df.iterrows():
-                    for val in row.dropna():
-                        match = pattern.search(str(val).strip())
-                        if match:
-                            qrs_to_find.add(match.group(1))
-
-            self.safe_log_qr(f"Найдено уникальных кодов в Excel: {len(qrs_to_find)}\n")
-            found_qrs = set()
-            
-            if qrs_to_find:
-                pdf_files = glob.glob(os.path.join(current_pdf_dir, '*.pdf'))
-                if not pdf_files:
-                    self.safe_log_qr("В папке нет PDF файлов.")
-                else:
-                    total_pages, matched_files, found_qrs = process_all_pdfs(
-                        current_pdf_dir, current_output_dir, qrs_to_find, self.safe_log_qr, self.safe_progress_qr
-                    )
-                    self.safe_log_qr(f"\nСохранено подходящих страниц в PDF: {total_pages}")
-
-            # Генерация отчета по неподтвержденным позициям
-            self.safe_stage_qr("Формирую отчет по ненайденным...")
-            wb_orig = openpyxl.load_workbook(current_excel)
-            wb_new = openpyxl.Workbook()
-            wb_new.remove(wb_new.active)
-            missing_total = 0
-
-            for sheet_name in wb_orig.sheetnames:
-                ws_orig = wb_orig[sheet_name]
-                ws_new = wb_new.create_sheet(title=sheet_name)
-                for row in ws_orig.iter_rows(values_only=False):
-                    row_text = " ".join([str(cell.value).strip() for cell in row if cell.value is not None])
-                    if row_text:
-                        matches = pattern.findall(row_text)
-                        if matches:
-                            if not any(m in found_qrs for m in matches):
-                                missing_total += 1
-                                ws_new.append([cell.value for cell in row])
-                        elif row[0].row == 1:
-                            ws_new.append([cell.value for cell in row])
-
-            report_path = os.path.join(current_output_dir, "Verification_Report.xlsx")
-            wb_new.save(report_path)
-            self.safe_log_qr(f"Отчет сохранен: Verification_Report.xlsx (Потеряшек: {missing_total})")
+            process_full_workflow(
+                scans_path, current_pdf_dir, current_output_dir, check_path, self.safe_log_qr, self.safe_progress_qr
+            )
             self.safe_stage_qr("Готово!")
-
         except Exception as e:
             self.safe_log_qr(f"Ошибка: {e}")
             self.safe_stage_qr("Произошла ошибка")
@@ -406,7 +644,6 @@ class MainApp(ctk.CTk):
             self.after(0, self.lbl_progress.pack_forget)
 
 
-    # --- ИНТЕРФЕЙС ВКЛАДКИ 2 (ПАРСЕР OZON) ---
     def init_ozon_tab(self):
         header = ctk.CTkLabel(self.tab_ozon, text="Парсер накладных Ozon в Excel", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
         header.pack(pady=(10, 15))
@@ -474,7 +711,7 @@ class MainApp(ctk.CTk):
         try:
             df_orders = parse_orders_from_pdf(pdf_path)
             if df_orders.empty:
-                self.safe_log_ozon("Не удалось найти заказы или товары по заданным шаблонам.")
+                self.safe_log_ozon("Не удалось найти заказы по заданным шаблонам.")
                 self.safe_stage_ozon("Завершено с предупреждением")
             else:
                 output_xlsx = os.path.join(out_dir, "Ozon_Orders_List.xlsx")
@@ -488,6 +725,154 @@ class MainApp(ctk.CTk):
         finally:
             self.after(0, lambda: self.btn_start_ozon.configure(state="normal"))
 
+
+    def init_split_tab(self):
+        header = ctk.CTkLabel(self.tab_split, text="Массовое разделение папки PDF", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
+        header.pack(pady=(10, 15))
+
+        split_frame = ctk.CTkFrame(self.tab_split, fg_color="transparent")
+        split_frame.pack(fill="x", padx=10, pady=5)
+
+        self.btn_split_in = ctk.CTkButton(split_frame, text="Папка с PDF", width=150, command=self.pick_split_in)
+        self.btn_split_in.grid(row=0, column=0, padx=(0, 10), pady=10)
+        self.entry_split_in = ctk.CTkEntry(split_frame, placeholder_text="Папка с исходными PDF не выбрана", width=570)
+        self.entry_split_in.grid(row=0, column=1, pady=10)
+
+        self.btn_split_out = ctk.CTkButton(split_frame, text="Куда сохранить?", width=150, command=self.pick_split_out)
+        self.btn_split_out.grid(row=1, column=0, padx=(0, 10), pady=10)
+        self.entry_split_out = ctk.CTkEntry(split_frame, placeholder_text="Папка для сохранения не выбрана", width=570)
+        self.entry_split_out.grid(row=1, column=1, pady=10)
+
+        self.btn_start_split = ctk.CTkButton(self.tab_split, text="Запустить массовое разделение", height=42, width=280, font=ctk.CTkFont(size=15), command=self.start_split_processing)
+        self.btn_start_split.pack(pady=15)
+
+        self.lbl_stage_split = ctk.CTkLabel(self.tab_split, text="Стадия: Готово к работе", text_color="#ffcc00", font=ctk.CTkFont(weight="bold"))
+        self.lbl_stage_split.pack(pady=5)
+
+        self.textbox_split = ctk.CTkTextbox(self.tab_split, width=750, height=310, fg_color="#1e1e1e")
+        self.textbox_split.pack(padx=10, pady=10, fill="both", expand=True)
+
+    def pick_split_in(self):
+        dirpath = filedialog.askdirectory(title="Выберите папку с PDF")
+        if dirpath:
+            self.entry_split_in.delete(0, 'end')
+            self.entry_split_in.insert(0, dirpath)
+
+    def pick_split_out(self):
+        dirpath = filedialog.askdirectory(title="Папка для сохранения")
+        if dirpath:
+            self.entry_split_out.delete(0, 'end')
+            self.entry_split_out.insert(0, dirpath)
+
+    def safe_log_split(self, msg):
+        self.after(0, lambda: self._append_log_split(msg))
+        
+    def _append_log_split(self, msg):
+        self.textbox_split.insert("end", msg + "\n")
+        self.textbox_split.see("end")
+
+    def safe_stage_split(self, msg):
+        self.after(0, lambda: self.lbl_stage_split.configure(text=f"Стадия: {msg}"))
+
+    def start_split_processing(self):
+        pdf_dir = self.entry_split_in.get()
+        out_dir = self.entry_split_out.get()
+
+        if not pdf_dir or not out_dir:
+            self.safe_stage_split("Ошибка: Выберите папку с PDF и папку сохранения!")
+            return
+
+        self.btn_start_split.configure(state="disabled")
+        self.textbox_split.delete("1.0", "end")
+
+        threading.Thread(target=self.run_folder_split_script, args=(pdf_dir, out_dir), daemon=True).start()
+
+    def run_folder_split_script(self, pdf_dir, out_dir):
+        self.safe_stage_split("Обработка папки...")
+        self.safe_log_split(f"Сканируем папку: {pdf_dir}")
+        try:
+            pdf_files = glob.glob(os.path.join(pdf_dir, '*.pdf'))
+            if not pdf_files:
+                self.safe_log_split("В выбранной папке нет PDF-файлов!")
+                self.safe_stage_split("Завершено")
+                return
+
+            master_male = fitz.open()
+            master_female = fitz.open()
+            master_other = fitz.open()
+
+            total_male = 0
+            total_female = 0
+            total_other = 0
+
+            for pdf_path in pdf_files:
+                filename = os.path.basename(pdf_path)
+                base_name = os.path.splitext(filename)[0]
+                self.safe_log_split(f"\nОбрабатываем файл: {filename}")
+
+                doc = fitz.open(pdf_path)
+                file_male = fitz.open()
+                file_female = fitz.open()
+                file_other = fitz.open()
+
+                f_male = 0
+                f_female = 0
+                f_other = 0
+
+                for page_num in range(len(doc)):
+                    text = doc[page_num].get_text().lower()
+
+                    if 'женск' in text or 'жен.' in text or 'w-' in text:
+                        file_female.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        master_female.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        f_female += 1
+                        total_female += 1
+                    elif 'мужск' in text or 'муж.' in text:
+                        file_male.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        master_male.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        f_male += 1
+                        total_male += 1
+                    else:
+                        file_other.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        master_other.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                        f_other += 1
+                        total_other += 1
+
+                if f_male > 0:
+                    file_male.save(os.path.join(out_dir, f"{base_name}_Мужские.pdf"))
+                if f_female > 0:
+                    file_female.save(os.path.join(out_dir, f"{base_name}_Женские.pdf"))
+                if f_other > 0:
+                    file_other.save(os.path.join(out_dir, f"{base_name}_Неопределенные.pdf"))
+
+                self.safe_log_split(f"  -> Мужских: {f_male}, Женских: {f_female}, Других: {f_other}")
+
+                file_male.close()
+                file_female.close()
+                file_other.close()
+                doc.close()
+
+            if total_male > 0:
+                master_male.save(os.path.join(out_dir, "All_Folder_Мужские.pdf"))
+                self.safe_log_split(f"\n[ИТОГ ПАПКИ] All_Folder_Мужские.pdf ({total_male} стр.)")
+            if total_female > 0:
+                master_female.save(os.path.join(out_dir, "All_Folder_Женские.pdf"))
+                self.safe_log_split(f"[ИТОГ ПАПКИ] All_Folder_Женские.pdf ({total_female} стр.)")
+            if total_other > 0:
+                master_other.save(os.path.join(out_dir, "All_Folder_Неопределенные.pdf"))
+                self.safe_log_split(f"[ИТОГ ПАПКИ] All_Folder_Неопределенные.pdf ({total_other} стр.)")
+
+            master_male.close()
+            master_female.close()
+            master_other.close()
+
+            self.safe_log_split("\nМассовое разделение папки успешно завершено!")
+            self.safe_stage_split("Успешно завершено!")
+        except Exception as e:
+            self.safe_log_split(f"Ошибка: {e}")
+            self.safe_stage_split("Произошла ошибка")
+        finally:
+            self.after(0, lambda: self.btn_start_split.configure(state="normal"))
 
 if __name__ == "__main__":
     app = MainApp()
