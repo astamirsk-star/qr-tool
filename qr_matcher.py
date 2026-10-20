@@ -121,12 +121,13 @@ def process_full_workflow(scans_excel_path, pdf_dir, output_dir, check_excel_pat
 
     log_callback(f"Сформировано пар (КИЗ + Баркод) из сканов: {len(paired_scans)}")
 
-    # 2.6 ЖЕЛЕЗНАЯ ЛОГИКА ПОИСКА
+    # 2.6 ЖЕЛЕЗНАЯ ЛОГИКА ПОИСКА И ОТСЛЕЖИВАНИЯ ДУБЛИКАТОВ
     records_for_1c = []
     lost_items = []
     
     pdf_kiz_masks = {} 
     matched_for_1c = 0
+    kiz_counts = {} # Словарь для отслеживания повторных пиков сканера
 
     for pair in paired_scans:
         s_kiz = pair['kiz']
@@ -136,7 +137,16 @@ def process_full_workflow(scans_excel_path, pdf_dir, output_dir, check_excel_pat
         lookup_gtin = ""
         short_serial = ""
         
+        is_duplicate = False
+        
         if s_kiz:
+            # Считаем количество сканирований этого КИЗа
+            if s_kiz in kiz_counts:
+                kiz_counts[s_kiz]['count'] += 1
+                is_duplicate = True
+            else:
+                kiz_counts[s_kiz] = {'count': 1, 'first_row': None}
+                
             m = re.search(r'01(\d{14})21(.{1,15})', s_kiz)
             if m:
                 lookup_gtin = m.group(1)
@@ -144,10 +154,13 @@ def process_full_workflow(scans_excel_path, pdf_dir, output_dir, check_excel_pat
                 serial_clean = re.sub(r'[^a-zA-Z0-9]', '', serial_raw).lower()
                 short_serial = serial_clean[:6] 
                 
-                if lookup_gtin not in pdf_kiz_masks:
-                    pdf_kiz_masks[lookup_gtin] = []
-                pdf_kiz_masks[lookup_gtin].append(short_serial)
+                # Добавляем КИЗ в поиск PDF ТОЛЬКО если это оригинальный (первый) пик
+                if not is_duplicate:
+                    if lookup_gtin not in pdf_kiz_masks:
+                        pdf_kiz_masks[lookup_gtin] = []
+                    pdf_kiz_masks[lookup_gtin].append(short_serial)
                 
+        # Ищем товар в базе
         if s_bar in map_common: info = map_common[s_bar]
         elif s_bar in map_gtin: info = map_gtin[s_bar]
         elif s_bar.zfill(14) in map_gtin: info = map_gtin[s_bar.zfill(14)]
@@ -170,18 +183,41 @@ def process_full_workflow(scans_excel_path, pdf_dir, output_dir, check_excel_pat
                 'no_kiz': not bool(s_kiz),
                 'no_barcode': not bool(s_bar)
             })
+            # Вычисляем строку, в которую записан товар на 1-м листе (+1 за шапку)
+            current_row = len(records_for_1c) + 1
             matched_for_1c += 1
+            
+            if s_kiz:
+                if not is_duplicate:
+                    # Запоминаем строчку первого сканирования
+                    kiz_counts[s_kiz]['first_row'] = current_row
+                else:
+                    # Записываем дубликат в Потеряшки с указанием строки оригинала
+                    first_r = kiz_counts[s_kiz]['first_row']
+                    lost_items.append({
+                        'Причина': f"Дубликат КИЗ (скан №{kiz_counts[s_kiz]['count']})",
+                        'Штрихкод / GTIN': b_common,
+                        'Детали': f"Оригинал в строке {first_r} (лист Детализированный). КИЗ: {s_kiz}"
+                    })
         else:
-            lost_items.append({
-                'Причина': 'Не найден в базе (Справочнике)',
-                'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
-                'Детали': s_kiz
-            })
+            if s_kiz and is_duplicate:
+                first_r = kiz_counts[s_kiz]['first_row']
+                lost_items.append({
+                    'Причина': f"Дубликат КИЗ (скан №{kiz_counts[s_kiz]['count']}) + Нет в базе",
+                    'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
+                    'Детали': f"Оригинал в строке {first_r if first_r else 'Неизвестно'}. КИЗ: {s_kiz}"
+                })
+            else:
+                lost_items.append({
+                    'Причина': 'Не найден в базе (Справочнике)',
+                    'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
+                    'Детали': s_kiz
+                })
 
     log_callback(f"Успешно сопоставлено для 1С: {matched_for_1c} из {len(paired_scans)} пар")
     
     total_kizs = sum(len(v) for v in pdf_kiz_masks.values())
-    log_callback(f"Строгих уникальных КИЗов для вырезки из PDF: {total_kizs} шт.")
+    log_callback(f"Уникальных КИЗов для вырезки из PDF: {total_kizs} шт.")
     log_callback("Начинаем сканирование и сортировку PDF-файлов...\n")
 
     # 3. Сканируем PDF-файлы
