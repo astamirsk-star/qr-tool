@@ -88,7 +88,6 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 v_str = fix_layout(v_str)
                 scanned_sequence.append(v_str)
         
-        # СОХРАНЯЕМ В ОТДЕЛЬНЫЙ EXCEL КАК ПРОСИЛ
         try:
             raw_out_path = os.path.join(output_dir, "My_Raw_Scans.xlsx")
             wb_raw = openpyxl.Workbook()
@@ -154,7 +153,9 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     
     pdf_kiz_masks = {} 
     matched_for_1c = 0
-    kiz_counts = {}
+    
+    # Словарь для отслеживания уникальности КИЗов и ПАР
+    kiz_seen = {} # s_kiz -> {'row': current_row, 'barcode': s_bar, 'count': 1}
 
     for pair in paired_scans:
         s_kiz = pair['kiz']
@@ -164,15 +165,20 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         lookup_gtin = ""
         short_serial = ""
         
-        is_duplicate = False
+        is_pair_dup = False
+        is_kiz_only_dup = False
         
         if s_kiz:
-            if s_kiz in kiz_counts:
-                kiz_counts[s_kiz]['count'] += 1
-                is_duplicate = True
-            else:
-                kiz_counts[s_kiz] = {'count': 1, 'first_row': None}
-                
+            # Проверяем на дубликаты
+            if s_kiz in kiz_seen:
+                kiz_seen[s_kiz]['count'] += 1
+                first_bar = kiz_seen[s_kiz]['barcode']
+                # Если баркод такой же как в первый раз - это дубликат пары
+                if s_bar == first_bar:
+                    is_pair_dup = True
+                else:
+                    is_kiz_only_dup = True
+            
             m = re.search(r'01(\d{14})21(.{1,15})', s_kiz)
             if m:
                 lookup_gtin = m.group(1)
@@ -180,11 +186,13 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 serial_clean = re.sub(r'[^a-zA-Z0-9]', '', serial_raw).lower()
                 short_serial = serial_clean[:6] 
                 
-                if not is_duplicate:
+                # Ищем в PDF только если это ПЕРВЫЙ скан этого КИЗа
+                if not (is_pair_dup or is_kiz_only_dup):
                     if lookup_gtin not in pdf_kiz_masks:
                         pdf_kiz_masks[lookup_gtin] = []
                     pdf_kiz_masks[lookup_gtin].append(short_serial)
                 
+        # Поиск по базе
         if s_bar in map_common: info = map_common[s_bar]
         elif s_bar in map_gtin: info = map_gtin[s_bar]
         elif s_bar.zfill(14) in map_gtin: info = map_gtin[s_bar.zfill(14)]
@@ -205,28 +213,39 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 'Наименование товара': info['name'],
                 'Количество': 1,
                 'no_kiz': not bool(s_kiz),
-                'no_barcode': not bool(s_bar)
+                'no_barcode': not bool(s_bar),
+                'is_pair_dup': is_pair_dup,
+                'is_kiz_only_dup': is_kiz_only_dup
             })
             current_row = len(records_for_1c) + 1
             matched_for_1c += 1
             
             if s_kiz:
-                if not is_duplicate:
-                    kiz_counts[s_kiz]['first_row'] = current_row
+                if not (is_pair_dup or is_kiz_only_dup):
+                    kiz_seen[s_kiz] = {'row': current_row, 'barcode': s_bar, 'count': 1}
                 else:
-                    first_r = kiz_counts[s_kiz]['first_row']
-                    lost_items.append({
-                        'Причина': f"Дубликат КИЗ (скан №{kiz_counts[s_kiz]['count']})",
-                        'Штрихкод / GTIN': b_common,
-                        'Детали': f"Оригинал в строке {first_r} (лист Детализированный). КИЗ: {s_kiz}"
-                    })
+                    first_r = kiz_seen[s_kiz]['row']
+                    scan_count = kiz_seen[s_kiz]['count']
+                    if is_pair_dup:
+                        lost_items.append({
+                            'Причина': f"Дубликат ПАРЫ (скан №{scan_count})",
+                            'Штрихкод / GTIN': b_common,
+                            'Детали': f"Оригинал в строке {first_r}. Точный повтор (ШК+КИЗ)."
+                        })
+                    else:
+                        lost_items.append({
+                            'Причина': f"Конфликт КИЗ (скан №{scan_count})",
+                            'Штрихкод / GTIN': b_common,
+                            'Детали': f"Оригинал в строке {first_r}. КИЗ совпал, но Баркод другой!"
+                        })
         else:
-            if s_kiz and is_duplicate:
-                first_r = kiz_counts[s_kiz]['first_row']
+            if s_kiz and (is_pair_dup or is_kiz_only_dup):
+                first_r = kiz_seen[s_kiz]['row']
+                scan_count = kiz_seen[s_kiz]['count']
                 lost_items.append({
-                    'Причина': f"Дубликат КИЗ (скан №{kiz_counts[s_kiz]['count']}) + Нет в базе",
+                    'Причина': f"Дубликат (скан №{scan_count}) + Нет в базе",
                     'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
-                    'Детали': f"Оригинал в строке {first_r if first_r else 'Неизвестно'}. КИЗ: {s_kiz}"
+                    'Детали': f"Оригинал в строке {first_r}. КИЗ: {s_kiz}"
                 })
             else:
                 lost_items.append({
@@ -341,8 +360,11 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         ws1.title = "Детализированный"
         ws1.append(['Отсканированный ШК', 'Баркод общий (для 1С)', 'ШК 2 (Ozon)', 'КИЗ (Честный ЗНАК)', 'Артикул продавца', 'Артикул WB', 'Артикул Ozon', 'Наименование товара', 'Количество'])
         
-        fill_no_kiz = openpyxl.styles.PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
-        fill_no_barcode = openpyxl.styles.PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid")
+        # Цветовая палитра
+        fill_no_kiz = openpyxl.styles.PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid") # Желтый
+        fill_no_barcode = openpyxl.styles.PatternFill(start_color="FF9999", end_color="FF9999", fill_type="solid") # Красный
+        fill_kiz_dup = openpyxl.styles.PatternFill(start_color="FF9900", end_color="FF9900", fill_type="solid") # Оранжевый
+        fill_pair_dup = openpyxl.styles.PatternFill(start_color="FF00FF", end_color="FF00FF", fill_type="solid") # Ярко-розовый (Маджента)
         
         for i, item in enumerate(records_for_1c, start=2):
             ws1.append([
@@ -350,23 +372,53 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 item['КИЗ (Честный ЗНАК)'], item['Артикул продавца'], item['Артикул WB'], 
                 item['Артикул Ozon'], item['Наименование товара'], 1
             ])
-            if item.get('no_barcode'):
-                for col in range(1, 10):
-                    ws1.cell(row=i, column=col).fill = fill_no_barcode
+            
+            # Применяем приоритетную подсветку
+            fill_to_apply = None
+            if item.get('is_pair_dup'):
+                fill_to_apply = fill_pair_dup
+            elif item.get('is_kiz_only_dup'):
+                fill_to_apply = fill_kiz_dup
+            elif item.get('no_barcode'):
+                fill_to_apply = fill_no_barcode
             elif item.get('no_kiz'):
+                fill_to_apply = fill_no_kiz
+                
+            if fill_to_apply:
                 for col in range(1, 10):
-                    ws1.cell(row=i, column=col).fill = fill_no_kiz
+                    ws1.cell(row=i, column=col).fill = fill_to_apply
             
         ws2 = wb_1c.create_sheet(title="Для загрузки в 1С")
         ws2.append(['Штрихкод', 'Количество'])
         
         if records_for_1c:
             df_det = pd.DataFrame(records_for_1c)
-            df_valid = df_det[(df_det['no_barcode'] == False) & (df_det['Баркод общий (для 1С)'] != "НЕТ ОБЩЕГО БАРКОДА В БАЗЕ")]
-            if not df_valid.empty:
-                df_summary = df_valid.groupby('Баркод общий (для 1С)')['Количество'].sum().reset_index()
-                for _, row in df_summary.iterrows():
-                    ws2.append([row['Баркод общий (для 1С)'], row['Количество']])
+            # Отсеиваем те, где нет ШК или не найдено в базе
+            df_valid_all = df_det[(df_det['no_barcode'] == False) & (df_det['Баркод общий (для 1С)'] != "НЕТ ОБЩЕГО БАРКОДА В БАЗЕ")]
+            
+            if not df_valid_all.empty:
+                # Разделяем на хорошие сканы и дубликаты пар
+                df_good = df_valid_all[df_valid_all['is_pair_dup'] == False]
+                df_pair_dups = df_valid_all[df_valid_all['is_pair_dup'] == True]
+                
+                # Пишем хорошие данные в основу
+                if not df_good.empty:
+                    df_summary = df_good.groupby('Баркод общий (для 1С)')['Количество'].sum().reset_index()
+                    for _, row in df_summary.iterrows():
+                        ws2.append([row['Баркод общий (для 1С)'], row['Количество']])
+                
+                # ОТДЕЛЬНО выводим дубликаты внизу таблицы
+                if not df_pair_dups.empty:
+                    ws2.append([]) # Пустая строка для отступа
+                    ws2.append(['--- ВНИМАНИЕ: ОТКЛОНЕННЫЕ ДУБЛИКАТЫ ПАР ---', ''])
+                    
+                    # Красим заголовок-предупреждение
+                    warn_cell = ws2.cell(row=ws2.max_row, column=1)
+                    warn_cell.font = openpyxl.styles.Font(bold=True, color="FF0000")
+                    
+                    df_dup_summary = df_pair_dups.groupby('Баркод общий (для 1С)')['Количество'].sum().reset_index()
+                    for _, row in df_dup_summary.iterrows():
+                        ws2.append([row['Баркод общий (для 1С)'], row['Количество']])
 
         ws3 = wb_1c.create_sheet(title="Потеряшки")
         ws3.append(['Причина', 'Штрихкод / GTIN', 'Детали'])
@@ -403,12 +455,12 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         ws1.column_dimensions['H'].width = 45
         ws1.column_dimensions['I'].width = 12
         
-        ws2.column_dimensions['A'].width = 22
+        ws2.column_dimensions['A'].width = 45
         ws2.column_dimensions['B'].width = 15
         
         ws3.column_dimensions['A'].width = 35
         ws3.column_dimensions['B'].width = 25
-        ws3.column_dimensions['C'].width = 40
+        ws3.column_dimensions['C'].width = 50
 
         wb_1c.save(output_1c)
         log_callback(f"\n[1С ИТОГ] Отчет сохранен (Потеряшки: {len(lost_items)} шт):\n{output_1c}")
@@ -554,13 +606,11 @@ class MainApp(ctk.CTk):
         files_frame = ctk.CTkFrame(self.tab_qr, fg_color="transparent")
         files_frame.pack(fill="x", padx=10, pady=5)
 
-        # НОВОЕ ПОЛЕ ДЛЯ ПРЯМОГО СКАНИРОВАНИЯ
         self.lbl_scan = ctk.CTkLabel(files_frame, text="1. Прямое сканирование (поставьте сюда курсор и пикайте сканером):", font=ctk.CTkFont(weight="bold"))
         self.lbl_scan.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
         self.textbox_direct_scans = ctk.CTkTextbox(files_frame, width=730, height=120, fg_color="#2b2b2b", border_width=2, border_color="#555555")
         self.textbox_direct_scans.grid(row=1, column=0, columnspan=2, pady=(0, 15))
 
-        # СТАРЫЙ ВАРИАНТ (Если нужно загрузить готовый файл)
         self.btn_scans = ctk.CTkButton(files_frame, text="ИЛИ выбрать Excel-скан", width=180, command=self.pick_scans_file)
         self.btn_scans.grid(row=2, column=0, padx=(0, 10), pady=8)
         self.entry_scans = ctk.CTkEntry(files_frame, placeholder_text="Файл не выбран (оставьте пустым, если сканируете выше)", width=540)
