@@ -96,7 +96,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
             ws_raw.append(["Отсканированный Штрихкод / КИЗ"])
             for s in scanned_sequence:
                 cell = ws_raw.cell(row=ws_raw.max_row + 1, column=1, value=str(s))
-                cell.number_format = '@' # Жесткий текстовый формат, чтобы Excel не портил цифры
+                cell.number_format = '@' 
             wb_raw.save(raw_out_path)
             log_callback(f"Ваши сканы сохранены в отдельный файл: My_Raw_Scans.xlsx")
         except Exception as e:
@@ -125,7 +125,6 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     temp_pair = {'kiz': "", 'barcode': ""}
     
     for token in scanned_sequence:
-        # НОВАЯ ЗАЩИТА: Игнорируем шапку, если пользователь загрузил My_Raw_Scans.xlsx обратно
         if "отсканированный" in str(token).lower() or "штрихкод" in str(token).lower() or "киз" in str(token).lower():
             continue
 
@@ -158,7 +157,6 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     
     pdf_kiz_masks = {} 
     matched_for_1c = 0
-    
     kiz_seen = {} 
 
     for pair in paired_scans:
@@ -459,7 +457,8 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     elif check_excel_path:
         log_callback("\n[1С ИТОГ] Справочник выбран, но ничего не найдено.")
 
-# --- ВТОРАЯ И ТРЕТЬЯ ВКЛАДКИ (Без изменений, просто оставляем для полноты кода) ---
+
+# --- ФУНКЦИИ ВТОРОЙ ВКЛАДКИ (ПАРСЕР OZON PDF С ОБНОВЛЕННЫМ УНИВЕРСАЛЬНЫМ ПОИСКОМ АРТИКУЛОВ) ---
 def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     reader = PdfReader(pdf_path)
     full_text = ""
@@ -471,19 +470,27 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     skus = []
     orders = []
     products = []
-    regex_sku = r'((?:(?:[A-Za-z]+[-_])?\d+[-_]\d+(?:/\d+)?|(?:[A-Za-z]+[-_]?)?\d+[\s-]*\(\d+-\d+\)[ _-]\d+|\b\d{5,9}\b|\b\d{3}[ _]\d{2}(?:/\d+)?)(?:\s*\([^)]+\))?)'
+    
+    # Идеальная регулярка: собирает артикул как конструктор, учитывая любые буквы, дефисы и пробелы до размера
+    regex_sku = r'((?:[A-Za-z]+[-_]?)?\d+(?:[-_][A-Za-z]+)?(?:[\s-]*\([^)]+\))?[\s_]+\d{2,3}(?:/\d{2,3})?(?:\s*\([^)]+\))?[-_]?|\b\d{5,10}\b)'
+    
     for i, line in enumerate(lines):
         line_clean = line
+        # Исправляем баг OCR Озона (когда он дублирует цифры через пробел, например: 621 1_32 32 -> 621_32)
         line_clean = re.sub(r'\b([A-Za-z0-9\-]*(\d))\s+\2_(\d+)\s+\3\b', r'\1_\3', line_clean)
+        
         m_order = re.search(r'\d{6,15}-\d{4}-\d{1,3}', line_clean)
         if m_order:
             orders.append((i, m_order.group(0)))
             line_clean = line_clean.replace(m_order.group(0), '')
+            
         m_sku = re.search(regex_sku, line_clean)
         if m_sku:
             sku_val = m_sku.group(1).strip()
+            # Доп. очистка озоновских опечаток внутри найденного чистого артикула
             sku_val = re.sub(r'(\d)\s+(\d)', r'\1_\2', sku_val)
             skus.append((i, sku_val))
+            
         prod = line_clean.replace('|', '').strip()
         if m_sku:
             prod = prod.replace(m_sku.group(0), '').strip()
@@ -492,6 +499,7 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
         if prod and len(prod) > 2 and not prod.replace('.', '', 1).isdigit():
             if not re.match(r'^(шт|руб|\d+\s*шт|\d+\s*руб)$', prod, re.IGNORECASE):
                 products.append((i, prod))
+                
     records = []
     for sku_idx, sku_val in skus:
         closest_order = min(orders, key=lambda x: abs(x[0] - sku_idx)) if orders else (0, '')
@@ -571,16 +579,21 @@ def save_to_formatted_excel(df: pd.DataFrame, output_path: str):
             cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
     wb.save(output_path)
 
+
+# --- ГЛАВНОЕ ОКНО ПРИЛОЖЕНИЯ ---
 class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Инструменты логистики")
         self.geometry("850x920")
+
         self.tabview = ctk.CTkTabview(self, width=810, height=880)
         self.tabview.pack(padx=20, pady=10, fill="both", expand=True)
+
         self.tab_qr = self.tabview.add("Сверка и 1С")
         self.tab_ozon = self.tabview.add("Парсер Ozon PDF")
         self.tab_split = self.tabview.add("Разделение папки PDF")
+
         self.init_qr_tab()
         self.init_ozon_tab()
         self.init_split_tab()
@@ -588,39 +601,50 @@ class MainApp(ctk.CTk):
     def init_qr_tab(self):
         header = ctk.CTkLabel(self.tab_qr, text="Обработка сканов, PDF и генерация 1С", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
         header.pack(pady=(10, 10))
+
         files_frame = ctk.CTkFrame(self.tab_qr, fg_color="transparent")
         files_frame.pack(fill="x", padx=10, pady=5)
+
         self.lbl_scan = ctk.CTkLabel(files_frame, text="1. Прямое сканирование (поставьте сюда курсор и пикайте сканером):", font=ctk.CTkFont(weight="bold"))
         self.lbl_scan.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
         self.textbox_direct_scans = ctk.CTkTextbox(files_frame, width=730, height=120, fg_color="#2b2b2b", border_width=2, border_color="#555555")
         self.textbox_direct_scans.grid(row=1, column=0, columnspan=2, pady=(0, 15))
+
         self.btn_scans = ctk.CTkButton(files_frame, text="ИЛИ выбрать Excel-скан", width=180, command=self.pick_scans_file)
         self.btn_scans.grid(row=2, column=0, padx=(0, 10), pady=8)
         self.entry_scans = ctk.CTkEntry(files_frame, placeholder_text="Файл не выбран (оставьте пустым, если сканируете выше)", width=540)
         self.entry_scans.grid(row=2, column=1, pady=8)
+
         self.btn_pdf_in = ctk.CTkButton(files_frame, text="Исходные PDF", width=180, command=self.pick_pdf_in)
         self.btn_pdf_in.grid(row=3, column=0, padx=(0, 10), pady=8)
         self.entry_pdf_in = ctk.CTkEntry(files_frame, placeholder_text="Папка с исходными PDF не выбрана", width=540)
         self.entry_pdf_in.grid(row=3, column=1, pady=8)
+
         self.btn_check = ctk.CTkButton(files_frame, text="Файл для сверки", width=180, command=self.pick_check_file)
         self.btn_check.grid(row=4, column=0, padx=(0, 10), pady=8)
         self.entry_check = ctk.CTkEntry(files_frame, placeholder_text="Файл справочника базы (необязательно)", width=540)
         self.entry_check.grid(row=4, column=1, pady=8)
+
         self.btn_pdf_out = ctk.CTkButton(files_frame, text="Куда сохранить?", width=180, command=self.pick_pdf_out)
         self.btn_pdf_out.grid(row=5, column=0, padx=(0, 10), pady=8)
         self.entry_pdf_out = ctk.CTkEntry(files_frame, placeholder_text="Папка для сохранения результатов не выбрана", width=540)
         self.entry_pdf_out.grid(row=5, column=1, pady=8)
+
         self.btn_start = ctk.CTkButton(self.tab_qr, text="Запустить обработку", height=42, width=280, font=ctk.CTkFont(size=15), command=self.start_qr_processing)
         self.btn_start.pack(pady=12)
+
         self.lbl_stage = ctk.CTkLabel(self.tab_qr, text="Стадия: Готово к работе", text_color="#ffcc00", font=ctk.CTkFont(weight="bold"))
         self.lbl_stage.pack(pady=3)
+
         self.progress_bar = ctk.CTkProgressBar(self.tab_qr, width=400)
         self.progress_bar.set(0)
         self.progress_bar.pack(pady=(3, 0))
         self.progress_bar.pack_forget()
+
         self.lbl_progress = ctk.CTkLabel(self.tab_qr, text="")
         self.lbl_progress.pack(pady=(0, 3))
         self.lbl_progress.pack_forget()
+
         self.textbox_qr = ctk.CTkTextbox(self.tab_qr, width=750, height=180, fg_color="#1e1e1e")
         self.textbox_qr.pack(padx=10, pady=5, fill="both", expand=True)
 
@@ -629,49 +653,62 @@ class MainApp(ctk.CTk):
         if filepath:
             self.entry_scans.delete(0, 'end')
             self.entry_scans.insert(0, filepath)
+
     def pick_pdf_in(self):
         dirpath = filedialog.askdirectory(title="Выберите папку PDF")
         if dirpath:
             self.entry_pdf_in.delete(0, 'end')
             self.entry_pdf_in.insert(0, dirpath)
+
     def pick_check_file(self):
         filepath = filedialog.askopenfilename(title="Выберите базу (справочник)", filetypes=[("Excel", "*.xlsx *.xls")])
         if filepath:
             self.entry_check.delete(0, 'end')
             self.entry_check.insert(0, filepath)
+
     def pick_pdf_out(self):
         dirpath = filedialog.askdirectory(title="Папка для сохранения")
         if dirpath:
             self.entry_pdf_out.delete(0, 'end')
             self.entry_pdf_out.insert(0, dirpath)
+
     def safe_log_qr(self, msg):
         self.after(0, lambda: self._append_log_qr(msg))
+        
     def _append_log_qr(self, msg):
         self.textbox_qr.insert("end", msg + "\n")
         self.textbox_qr.see("end")
+
     def safe_stage_qr(self, msg):
         self.after(0, lambda: self.lbl_stage.configure(text=f"Стадия: {msg}"))
+
     def safe_progress_qr(self, current, total, filename):
         def update():
             self.progress_bar.set(current / total if total > 0 else 0)
             self.lbl_progress.configure(text=f"{current} / {total} файлов")
             self.lbl_stage.configure(text=f"Проверяю: {filename}")
         self.after(0, update)
+
     def start_qr_processing(self):
         scans_path = self.entry_scans.get()
         direct_scans_text = self.textbox_direct_scans.get("1.0", "end-1c")
+        
         pdf_in = self.entry_pdf_in.get()
         check_path = self.entry_check.get()
         pdf_out = self.entry_pdf_out.get()
+
         if (not scans_path and not direct_scans_text.strip()) or not pdf_in or not pdf_out:
             self.safe_stage_qr("Ошибка: Заполните обязательные поля или отсканируйте штрихкоды!")
             return
+
         self.btn_start.configure(state="disabled")
         self.progress_bar.pack(pady=(3, 0))
         self.lbl_progress.pack(pady=(0, 3))
         self.progress_bar.set(0)
         self.textbox_qr.delete("1.0", "end")
+
         threading.Thread(target=self.run_full_script, args=(scans_path, direct_scans_text, pdf_in, pdf_out, check_path), daemon=True).start()
+
     def run_full_script(self, scans_path, direct_scans_text, current_pdf_dir, current_output_dir, check_path):
         self.safe_stage_qr("Выполнение процесса...")
         self.safe_log_qr("Запуск обработки...")
@@ -687,6 +724,7 @@ class MainApp(ctk.CTk):
             self.after(0, lambda: self.btn_start.configure(state="normal"))
             self.after(0, self.progress_bar.pack_forget)
             self.after(0, self.lbl_progress.pack_forget)
+
 
     def init_ozon_tab(self):
         header = ctk.CTkLabel(self.tab_ozon, text="Парсер накладных Ozon в Excel", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
