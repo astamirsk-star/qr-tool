@@ -159,7 +159,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     matched_for_1c = 0
     kiz_seen = {} 
 
-    for pair in paired_scans:
+    for scan_idx, pair in enumerate(paired_scans, start=1):
         s_kiz = pair['kiz']
         s_bar = pair['barcode']
         
@@ -189,7 +189,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 if not (is_pair_dup or is_kiz_only_dup):
                     if lookup_gtin not in pdf_kiz_masks:
                         pdf_kiz_masks[lookup_gtin] = []
-                    pdf_kiz_masks[lookup_gtin].append(short_serial)
+                    pdf_kiz_masks[lookup_gtin].append({'serial': short_serial, 'row': scan_idx})
                 
         if s_bar in map_common: info = map_common[s_bar]
         elif s_bar in map_gtin: info = map_gtin[s_bar]
@@ -215,39 +215,36 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 'is_pair_dup': is_pair_dup,
                 'is_kiz_only_dup': is_kiz_only_dup
             })
-            current_row = len(records_for_1c) + 1
             matched_for_1c += 1
             
             if s_kiz:
                 if not (is_pair_dup or is_kiz_only_dup):
-                    kiz_seen[s_kiz] = {'row': current_row, 'barcode': s_bar, 'count': 1}
+                    kiz_seen[s_kiz] = {'row': scan_idx, 'barcode': s_bar, 'count': 1}
                 else:
                     first_r = kiz_seen[s_kiz]['row']
-                    scan_count = kiz_seen[s_kiz]['count']
                     if is_pair_dup:
                         lost_items.append({
-                            'Причина': f"Дубликат ПАРЫ (скан №{scan_count})",
+                            'Причина': f"Дубликат ПАРЫ (Скан №{scan_idx})",
                             'Штрихкод / GTIN': b_common,
-                            'Детали': f"Оригинал в строке {first_r}. Точный повтор (ШК+КИЗ)."
+                            'Детали': f"Оригинал был в скане №{first_r}. Точный повтор."
                         })
                     else:
                         lost_items.append({
-                            'Причина': f"Конфликт КИЗ (скан №{scan_count})",
+                            'Причина': f"Конфликт КИЗ (Скан №{scan_idx})",
                             'Штрихкод / GTIN': b_common,
-                            'Детали': f"Оригинал в строке {first_r}. КИЗ совпал, но Баркод другой!"
+                            'Детали': f"Оригинал в скане №{first_r}. КИЗ совпал, но Баркод другой!"
                         })
         else:
             if s_kiz and (is_pair_dup or is_kiz_only_dup):
                 first_r = kiz_seen[s_kiz]['row']
-                scan_count = kiz_seen[s_kiz]['count']
                 lost_items.append({
-                    'Причина': f"Дубликат (скан №{scan_count}) + Нет в базе",
+                    'Причина': f"Дубликат (Скан №{scan_idx}) + Нет в базе",
                     'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
-                    'Детали': f"Оригинал в строке {first_r}. КИЗ: {s_kiz}"
+                    'Детали': f"Оригинал был в скане №{first_r}. КИЗ: {s_kiz}"
                 })
             else:
                 lost_items.append({
-                    'Причина': 'Не найден в базе (Справочнике)',
+                    'Причина': f"Не найден в базе (Скан №{scan_idx})",
                     'Штрихкод / GTIN': s_bar if s_bar else lookup_gtin,
                     'Детали': s_kiz
                 })
@@ -291,14 +288,14 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 
                 for target_gtin, serials in pdf_kiz_masks.items():
                     if target_gtin.lower() in clean_text:
-                        matched_serial = None
-                        for serial in serials:
-                            if serial in clean_text:
+                        matched_serial_info = None
+                        for s_info in serials:
+                            if s_info['serial'] in clean_text:
                                 is_match = True
-                                matched_serial = serial
+                                matched_serial_info = s_info
                                 break
-                        if matched_serial:
-                            serials.remove(matched_serial)
+                        if matched_serial_info:
+                            serials.remove(matched_serial_info)
                             break
                             
                 if is_match:
@@ -342,11 +339,11 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     doc_other.close()
 
     for target_gtin, serials in pdf_kiz_masks.items():
-        for serial in serials:
+        for s_info in serials:
             lost_items.append({
-                'Причина': 'Не найдена этикетка в PDF (КИЗ)',
+                'Причина': f"Нет в PDF (Скан № {s_info['row']})",
                 'Штрихкод / GTIN': target_gtin,
-                'Детали': f"Хвост серийника: {serial}"
+                'Детали': f"Хвост серийника: {s_info['serial']}"
             })
 
     # 4. Генерируем файл для 1С И ВКЛАДКУ ПОТЕРЯШЕК
@@ -458,7 +455,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         log_callback("\n[1С ИТОГ] Справочник выбран, но ничего не найдено.")
 
 
-# --- ФУНКЦИИ ВТОРОЙ ВКЛАДКИ (ПАРСЕР OZON PDF С ОБНОВЛЕННЫМ УНИВЕРСАЛЬНЫМ ПОИСКОМ АРТИКУЛОВ) ---
+# --- ФУНКЦИИ ВТОРОЙ ВКЛАДКИ (ПАРСЕР OZON PDF) ---
 def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     reader = PdfReader(pdf_path)
     full_text = ""
@@ -471,12 +468,10 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     orders = []
     products = []
     
-    # Идеальная регулярка: собирает артикул как конструктор, учитывая любые буквы, дефисы и пробелы до размера
     regex_sku = r'((?:[A-Za-z]+[-_]?)?\d+(?:[-_][A-Za-z]+)?(?:[\s-]*\([^)]+\))?[\s_]+\d{2,3}(?:/\d{2,3})?(?:\s*\([^)]+\))?[-_]?|\b\d{5,10}\b)'
     
     for i, line in enumerate(lines):
         line_clean = line
-        # Исправляем баг OCR Озона (когда он дублирует цифры через пробел, например: 621 1_32 32 -> 621_32)
         line_clean = re.sub(r'\b([A-Za-z0-9\-]*(\d))\s+\2_(\d+)\s+\3\b', r'\1_\3', line_clean)
         
         m_order = re.search(r'\d{6,15}-\d{4}-\d{1,3}', line_clean)
@@ -487,7 +482,6 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
         m_sku = re.search(regex_sku, line_clean)
         if m_sku:
             sku_val = m_sku.group(1).strip()
-            # Доп. очистка озоновских опечаток внутри найденного чистого артикула
             sku_val = re.sub(r'(\d)\s+(\d)', r'\1_\2', sku_val)
             skus.append((i, sku_val))
             
@@ -745,23 +739,29 @@ class MainApp(ctk.CTk):
         self.lbl_stage_ozon.pack(pady=5)
         self.textbox_ozon = ctk.CTkTextbox(self.tab_ozon, width=750, height=310, fg_color="#1e1e1e")
         self.textbox_ozon.pack(padx=10, pady=10, fill="both", expand=True)
+
     def pick_ozon_pdf(self):
         filepath = filedialog.askopenfilename(title="Выберите PDF файл Ozon", filetypes=[("PDF", "*.pdf")])
         if filepath:
             self.entry_ozon_pdf.delete(0, 'end')
             self.entry_ozon_pdf.insert(0, filepath)
+
     def pick_ozon_out(self):
         dirpath = filedialog.askdirectory(title="Выберите папку для сохранения отчета")
         if dirpath:
             self.entry_ozon_out.delete(0, 'end')
             self.entry_ozon_out.insert(0, dirpath)
+
     def safe_log_ozon(self, msg):
         self.after(0, lambda: self._append_log_ozon(msg))
+
     def _append_log_ozon(self, msg):
         self.textbox_ozon.insert("end", msg + "\n")
         self.textbox_ozon.see("end")
+
     def safe_stage_ozon(self, msg):
         self.after(0, lambda: self.lbl_stage_ozon.configure(text=f"Стадия: {msg}"))
+
     def start_ozon_processing(self):
         pdf_path = self.entry_ozon_pdf.get()
         out_dir = self.entry_ozon_out.get()
@@ -771,6 +771,7 @@ class MainApp(ctk.CTk):
         self.btn_start_ozon.configure(state="disabled")
         self.textbox_ozon.delete("1.0", "end")
         threading.Thread(target=self.run_ozon_script, args=(pdf_path, out_dir), daemon=True).start()
+
     def run_ozon_script(self, pdf_path, out_dir):
         self.safe_stage_ozon("Парсинг PDF...")
         self.safe_log_ozon(f"Читаем файл: {os.path.basename(pdf_path)}")
@@ -810,23 +811,29 @@ class MainApp(ctk.CTk):
         self.lbl_stage_split.pack(pady=5)
         self.textbox_split = ctk.CTkTextbox(self.tab_split, width=750, height=310, fg_color="#1e1e1e")
         self.textbox_split.pack(padx=10, pady=10, fill="both", expand=True)
+
     def pick_split_in(self):
         dirpath = filedialog.askdirectory(title="Выберите папку с PDF")
         if dirpath:
             self.entry_split_in.delete(0, 'end')
             self.entry_split_in.insert(0, dirpath)
+
     def pick_split_out(self):
         dirpath = filedialog.askdirectory(title="Папка для сохранения")
         if dirpath:
             self.entry_split_out.delete(0, 'end')
             self.entry_split_out.insert(0, dirpath)
+
     def safe_log_split(self, msg):
         self.after(0, lambda: self._append_log_split(msg))
+
     def _append_log_split(self, msg):
         self.textbox_split.insert("end", msg + "\n")
         self.textbox_split.see("end")
+
     def safe_stage_split(self, msg):
         self.after(0, lambda: self.lbl_stage_split.configure(text=f"Стадия: {msg}"))
+
     def start_split_processing(self):
         pdf_dir = self.entry_split_in.get()
         out_dir = self.entry_split_out.get()
@@ -836,32 +843,40 @@ class MainApp(ctk.CTk):
         self.btn_start_split.configure(state="disabled")
         self.textbox_split.delete("1.0", "end")
         threading.Thread(target=self.run_folder_split_script, args=(pdf_dir, out_dir), daemon=True).start()
+
     def run_folder_split_script(self, pdf_dir, out_dir):
-        self.safe_stage_split("Обработка папки...")
-        self.safe_log_split(f"Сканируем папку: {pdf_dir}")
+        self.safe_stage_split("Обработка папок...")
+        self.safe_log_split(f"Сканируем папку и все её подпапки:\n{pdf_dir}")
         try:
-            pdf_files = glob.glob(os.path.join(pdf_dir, '*.pdf'))
+            search_pattern = os.path.join(pdf_dir, '**', '*.pdf')
+            pdf_files = glob.glob(search_pattern, recursive=True)
+            
             if not pdf_files:
-                self.safe_log_split("В выбранной папке нет PDF-файлов!")
+                self.safe_log_split("В выбранной директории и её подпапках нет PDF-файлов!")
                 self.safe_stage_split("Завершено")
                 return
+
             master_male = fitz.open()
             master_female = fitz.open()
             master_other = fitz.open()
-            total_male = 0
-            total_female = 0
-            total_other = 0
+            total_male, total_female, total_other = 0, 0, 0
+
             for pdf_path in pdf_files:
                 filename = os.path.basename(pdf_path)
+                parent_folder = os.path.basename(os.path.dirname(pdf_path))
                 base_name = os.path.splitext(filename)[0]
-                self.safe_log_split(f"\nОбрабатываем файл: {filename}")
+                
+                if os.path.normpath(os.path.dirname(pdf_path)) != os.path.normpath(pdf_dir):
+                    base_name = f"{parent_folder}_{base_name}"
+
+                self.safe_log_split(f"\nЧитаем: {filename} (из папки /{parent_folder})")
+                
                 doc = fitz.open(pdf_path)
                 file_male = fitz.open()
                 file_female = fitz.open()
                 file_other = fitz.open()
-                f_male = 0
-                f_female = 0
-                f_other = 0
+                f_male, f_female, f_other = 0, 0, 0
+                
                 for page_num in range(len(doc)):
                     text = doc[page_num].get_text().lower()
                     if 'женск' in text or 'жен.' in text or 'w-' in text:
@@ -879,30 +894,32 @@ class MainApp(ctk.CTk):
                         master_other.insert_pdf(doc, from_page=page_num, to_page=page_num)
                         f_other += 1
                         total_other += 1
-                if f_male > 0:
-                    file_male.save(os.path.join(out_dir, f"{base_name}_Мужские.pdf"))
-                if f_female > 0:
-                    file_female.save(os.path.join(out_dir, f"{base_name}_Женские.pdf"))
-                if f_other > 0:
-                    file_other.save(os.path.join(out_dir, f"{base_name}_Неопределенные.pdf"))
-                self.safe_log_split(f"  -> Мужских: {f_male}, Женских: {f_female}, Других: {f_other}")
+                        
+                if f_male > 0: file_male.save(os.path.join(out_dir, f"{base_name}_Мужские.pdf"))
+                if f_female > 0: file_female.save(os.path.join(out_dir, f"{base_name}_Женские.pdf"))
+                if f_other > 0: file_other.save(os.path.join(out_dir, f"{base_name}_Неопределенные.pdf"))
+                
+                self.safe_log_split(f"  -> Муж: {f_male}, Жен: {f_female}, Др: {f_other}")
+                
                 file_male.close()
                 file_female.close()
                 file_other.close()
                 doc.close()
+                
             if total_male > 0:
                 master_male.save(os.path.join(out_dir, "All_Folder_Мужские.pdf"))
-                self.safe_log_split(f"\n[ИТОГ ПАПКИ] All_Folder_Мужские.pdf ({total_male} стр.)")
+                self.safe_log_split(f"\n[ИТОГ] All_Folder_Мужские.pdf ({total_male} стр.)")
             if total_female > 0:
                 master_female.save(os.path.join(out_dir, "All_Folder_Женские.pdf"))
-                self.safe_log_split(f"[ИТОГ ПАПКИ] All_Folder_Женские.pdf ({total_female} стр.)")
+                self.safe_log_split(f"[ИТОГ] All_Folder_Женские.pdf ({total_female} стр.)")
             if total_other > 0:
                 master_other.save(os.path.join(out_dir, "All_Folder_Неопределенные.pdf"))
-                self.safe_log_split(f"[ИТОГ ПАПКИ] All_Folder_Неопределенные.pdf ({total_other} стр.)")
+                self.safe_log_split(f"[ИТОГ] All_Folder_Неопределенные.pdf ({total_other} стр.)")
+                
             master_male.close()
             master_female.close()
             master_other.close()
-            self.safe_log_split("\nМассовое разделение папки успешно завершено!")
+            self.safe_log_split("\nРекурсивное разделение папок успешно завершено!")
             self.safe_stage_split("Успешно завершено!")
         except Exception as e:
             self.safe_log_split(f"Ошибка: {e}")
