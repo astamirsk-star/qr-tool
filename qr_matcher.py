@@ -1,3 +1,4 @@
+```python
 import customtkinter as ctk
 from tkinter import filedialog
 import os
@@ -719,7 +720,6 @@ class MainApp(ctk.CTk):
             self.after(0, self.progress_bar.pack_forget)
             self.after(0, self.lbl_progress.pack_forget)
 
-
     def init_ozon_tab(self):
         header = ctk.CTkLabel(self.tab_ozon, text="Парсер накладных Ozon в Excel", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
         header.pack(pady=(10, 15))
@@ -848,6 +848,7 @@ class MainApp(ctk.CTk):
         self.safe_stage_split("Обработка папок...")
         self.safe_log_split(f"Сканируем папку и все её подпапки:\n{pdf_dir}")
         try:
+            # Ищем все PDF-файлы во всех вложенных папках
             search_pattern = os.path.join(pdf_dir, '**', '*.pdf')
             pdf_files = glob.glob(search_pattern, recursive=True)
             
@@ -863,13 +864,14 @@ class MainApp(ctk.CTk):
 
             for pdf_path in pdf_files:
                 filename = os.path.basename(pdf_path)
-                parent_folder = os.path.basename(os.path.dirname(pdf_path))
+                current_dir = os.path.dirname(pdf_path) # Папка, где лежит именно этот PDF
                 base_name = os.path.splitext(filename)[0]
                 
-                if os.path.normpath(os.path.dirname(pdf_path)) != os.path.normpath(pdf_dir):
-                    base_name = f"{parent_folder}_{base_name}"
+                # Защита: пропускаем файлы, которые мы уже разрезали, чтобы не резать их по второму кругу
+                if base_name.endswith('_Мужские') or base_name.endswith('_Женские') or base_name.endswith('_Неопределенные') or base_name.startswith('All_Folder_'):
+                    continue
 
-                self.safe_log_split(f"\nЧитаем: {filename} (из папки /{parent_folder})")
+                self.safe_log_split(f"\nЧитаем: {filename}\n(В папке: {current_dir})")
                 
                 doc = fitz.open(pdf_path)
                 file_male = fitz.open()
@@ -895,9 +897,10 @@ class MainApp(ctk.CTk):
                         f_other += 1
                         total_other += 1
                         
-                if f_male > 0: file_male.save(os.path.join(out_dir, f"{base_name}_Мужские.pdf"))
-                if f_female > 0: file_female.save(os.path.join(out_dir, f"{base_name}_Женские.pdf"))
-                if f_other > 0: file_other.save(os.path.join(out_dir, f"{base_name}_Неопределенные.pdf"))
+                # МАГИЯ ЗДЕСЬ: Сохраняем разделенные файлы прямо в ту же папку (current_dir)
+                if f_male > 0: file_male.save(os.path.join(current_dir, f"{base_name}_Мужские.pdf"))
+                if f_female > 0: file_female.save(os.path.join(current_dir, f"{base_name}_Женские.pdf"))
+                if f_other > 0: file_other.save(os.path.join(current_dir, f"{base_name}_Неопределенные.pdf"))
                 
                 self.safe_log_split(f"  -> Муж: {f_male}, Жен: {f_female}, Др: {f_other}")
                 
@@ -906,20 +909,22 @@ class MainApp(ctk.CTk):
                 file_other.close()
                 doc.close()
                 
+            # Общие сводные файлы (со всех папок разом) кладем в ту папку, что указана в "Куда сохранить"
             if total_male > 0:
                 master_male.save(os.path.join(out_dir, "All_Folder_Мужские.pdf"))
-                self.safe_log_split(f"\n[ИТОГ] All_Folder_Мужские.pdf ({total_male} стр.)")
+                self.safe_log_split(f"\n[ОБЩИЙ ИТОГ] All_Folder_Мужские.pdf ({total_male} стр.) сохранен в папку вывода.")
             if total_female > 0:
                 master_female.save(os.path.join(out_dir, "All_Folder_Женские.pdf"))
-                self.safe_log_split(f"[ИТОГ] All_Folder_Женские.pdf ({total_female} стр.)")
+                self.safe_log_split(f"[ОБЩИЙ ИТОГ] All_Folder_Женские.pdf ({total_female} стр.)")
             if total_other > 0:
                 master_other.save(os.path.join(out_dir, "All_Folder_Неопределенные.pdf"))
-                self.safe_log_split(f"[ИТОГ] All_Folder_Неопределенные.pdf ({total_other} стр.)")
+                self.safe_log_split(f"[ОБЩИЙ ИТОГ] All_Folder_Неопределенные.pdf ({total_other} стр.)")
                 
             master_male.close()
             master_female.close()
             master_other.close()
-            self.safe_log_split("\nРекурсивное разделение папок успешно завершено!")
+            
+            self.safe_log_split("\nМассовое разделение папок успешно завершено!")
             self.safe_stage_split("Успешно завершено!")
         except Exception as e:
             self.safe_log_split(f"Ошибка: {e}")
@@ -930,3 +935,4 @@ class MainApp(ctk.CTk):
 if __name__ == "__main__":
     app = MainApp()
     app.mainloop()
+```
