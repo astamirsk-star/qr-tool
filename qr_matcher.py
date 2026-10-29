@@ -1,4 +1,4 @@
-```python
+python
 import customtkinter as ctk
 from tkinter import filedialog
 import os
@@ -935,4 +935,3 @@ class MainApp(ctk.CTk):
 if __name__ == "__main__":
     app = MainApp()
     app.mainloop()
-```
