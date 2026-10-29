@@ -1,4 +1,3 @@
-python
 import customtkinter as ctk
 from tkinter import filedialog
 import os
