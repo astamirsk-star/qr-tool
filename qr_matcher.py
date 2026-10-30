@@ -31,7 +31,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         en_chars = 'qwertyuiop[]asdfghjkl;\'zxcvbnm,.QWERTYUIOP{}ASDFGHJKL:"ZXCVBNM<>`~@#$^&?/'
         return s.translate(str.maketrans(ru_chars, en_chars))
 
-    # 1. Загружаем справочник (с новыми колонками Ozon_WB_объединены)
+    # 1. Загружаем справочник (УМНЫЙ ПОИСК КОЛОНОК ПО НАЗВАНИЯМ)
     map_gtin = {}
     map_common = {}
     map_ozn = {}
@@ -40,46 +40,67 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         log_callback(f"Загружаем справочник: {os.path.basename(check_excel_path)}")
         try:
             df_db_raw = pd.read_excel(check_excel_path, sheet_name=0, header=None, dtype=str)
-            df_db = df_db_raw.copy()
             
-            # Новые индексы для файла "Ozon_WB_объединены_по_баркоду_20"
-            rename_dict = {}
-            if 0 in df_db.columns: rename_dict[0] = 'Seller_Art'
-            if 1 in df_db.columns: rename_dict[1] = 'WB_Art'
-            if 4 in df_db.columns: rename_dict[4] = 'Barcode_Common'
-            if 5 in df_db.columns: rename_dict[5] = 'GTIN'
-            if 8 in df_db.columns: rename_dict[8] = 'Ozon_Art'
-            if 10 in df_db.columns: rename_dict[10] = 'Name'
-            if 12 in df_db.columns: rename_dict[12] = 'SK_2'
+            header_row_idx = -1
+            col_map = {}
             
-            df_db = df_db.rename(columns=rename_dict)
-            
-            for _, row in df_db.iterrows():
-                b_common = clean_val(row.get('Barcode_Common', ''))
-                gtin = clean_val(row.get('GTIN', ''))
-                seller_art = str(row.get('Seller_Art', '')).lower().strip()
-                
-                # Защита от двойной шапки: пропускаем строки с текстом заголовков
-                if b_common.lower() == 'баркод' or seller_art == 'артикул продавца' or seller_art == 'wb':
-                    continue
+            # Сканируем первые 10 строк, чтобы найти шапку таблицы
+            for idx, row in df_db_raw.head(10).iterrows():
+                row_vals_full = [str(x).strip().lower() if pd.notna(x) else "" for x in row.values]
+                if 'баркод' in row_vals_full and 'gtin' in row_vals_full:
+                    header_row_idx = idx
+                    for col_idx, val in enumerate(row_vals_full):
+                        if val == 'артикул продавца': col_map['Seller_Art'] = col_idx
+                        elif val == 'артикул wb': col_map['WB_Art'] = col_idx
+                        elif val == 'баркод': col_map['Barcode_Common'] = col_idx
+                        elif val == 'gtin': col_map['GTIN'] = col_idx
+                        elif val == 'название товара': col_map['Name'] = col_idx
+                        elif val == 'шк 2': col_map['SK_2'] = col_idx
+                        elif val == 'артикул': col_map['Ozon_Art'] = col_idx
+                    break
                     
+            if header_row_idx == -1:
+                log_callback("❌ Ошибка: Не найдена строка с заголовками (Баркод, GTIN). Проверьте структуру файла!")
+                self.safe_stage_qr("Ошибка чтения базы")
+                return
+                
+            log_callback("Шапка таблицы найдена. Индексируем товары...")
+            
+            # Читаем данные, начиная со строки ПОСЛЕ найденной шапки
+            for idx, row in df_db_raw.iloc[header_row_idx+1:].iterrows():
+                def get_val(col_key):
+                    c_idx = col_map.get(col_key)
+                    if c_idx is not None and c_idx < len(row):
+                        return clean_val(row.iloc[c_idx])
+                    return ""
+                
+                b_common = get_val('Barcode_Common')
+                gtin = get_val('GTIN')
+                seller_art = get_val('Seller_Art')
+                
                 if gtin and len(gtin) in [13, 14]:
                     gtin = gtin.zfill(14)
-                ozn = clean_val(row.get('SK_2', ''))
+                ozn = get_val('SK_2')
+                
+                # Если строка пустая (нет даже баркода), пропускаем её
+                if not b_common and not gtin:
+                    continue
                 
                 info = {
                     'barcode_common': b_common,
                     'gtin': gtin,
-                    'seller_art': clean_val(row.get('Seller_Art', '')),
-                    'wb_art': clean_val(row.get('WB_Art', '')),
-                    'ozon_art': clean_val(row.get('Ozon_Art', '')),
-                    'name': clean_val(row.get('Name', '')),
+                    'seller_art': seller_art,
+                    'wb_art': get_val('WB_Art'),
+                    'ozon_art': get_val('Ozon_Art'),
+                    'name': get_val('Name'),
                     'sk_2': ozn
                 }
+                
                 if b_common: map_common[b_common] = info
                 if gtin: map_gtin[gtin] = info
                 if ozn: map_ozn[ozn] = info
-            log_callback(f"Справочник успешно загружен (позиций: {len(map_common)}).")
+                
+            log_callback(f"Справочник успешно загружен (уникальных позиций: {len(map_common)}).")
         except Exception as e:
             log_callback(f"Ошибка при чтении файла сверки: {e}")
 
