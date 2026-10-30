@@ -31,7 +31,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
         en_chars = 'qwertyuiop[]asdfghjkl;\'zxcvbnm,.QWERTYUIOP{}ASDFGHJKL:"ZXCVBNM<>`~@#$^&?/'
         return s.translate(str.maketrans(ru_chars, en_chars))
 
-    # 1. Загружаем справочник
+    # 1. Загружаем справочник (с новыми колонками Ozon_WB_объединены)
     map_gtin = {}
     map_common = {}
     map_ozn = {}
@@ -42,20 +42,27 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
             df_db_raw = pd.read_excel(check_excel_path, sheet_name=0, header=None, dtype=str)
             df_db = df_db_raw.copy()
             
+            # Новые индексы для файла "Ozon_WB_объединены_по_баркоду_20"
             rename_dict = {}
             if 0 in df_db.columns: rename_dict[0] = 'Seller_Art'
             if 1 in df_db.columns: rename_dict[1] = 'WB_Art'
-            if 4 in df_db.columns: rename_dict[4] = 'GTIN'
-            if 7 in df_db.columns: rename_dict[7] = 'Barcode_Common'
+            if 4 in df_db.columns: rename_dict[4] = 'Barcode_Common'
+            if 5 in df_db.columns: rename_dict[5] = 'GTIN'
             if 8 in df_db.columns: rename_dict[8] = 'Ozon_Art'
             if 10 in df_db.columns: rename_dict[10] = 'Name'
-            if 11 in df_db.columns: rename_dict[11] = 'SK_2'
+            if 12 in df_db.columns: rename_dict[12] = 'SK_2'
             
             df_db = df_db.rename(columns=rename_dict)
             
             for _, row in df_db.iterrows():
                 b_common = clean_val(row.get('Barcode_Common', ''))
                 gtin = clean_val(row.get('GTIN', ''))
+                seller_art = str(row.get('Seller_Art', '')).lower().strip()
+                
+                # Защита от двойной шапки: пропускаем строки с текстом заголовков
+                if b_common.lower() == 'баркод' or seller_art == 'артикул продавца' or seller_art == 'wb':
+                    continue
+                    
                 if gtin and len(gtin) in [13, 14]:
                     gtin = gtin.zfill(14)
                 ozn = clean_val(row.get('SK_2', ''))
@@ -72,7 +79,7 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                 if b_common: map_common[b_common] = info
                 if gtin: map_gtin[gtin] = info
                 if ozn: map_ozn[ozn] = info
-            log_callback("Справочник успешно загружен.")
+            log_callback(f"Справочник успешно загружен (позиций: {len(map_common)}).")
         except Exception as e:
             log_callback(f"Ошибка при чтении файла сверки: {e}")
 
@@ -719,6 +726,7 @@ class MainApp(ctk.CTk):
             self.after(0, self.progress_bar.pack_forget)
             self.after(0, self.lbl_progress.pack_forget)
 
+
     def init_ozon_tab(self):
         header = ctk.CTkLabel(self.tab_ozon, text="Парсер накладных Ozon в Excel", font=ctk.CTkFont(size=22, weight="bold"), text_color="#90CAF9")
         header.pack(pady=(10, 15))
@@ -847,7 +855,6 @@ class MainApp(ctk.CTk):
         self.safe_stage_split("Обработка папок...")
         self.safe_log_split(f"Сканируем папку и все её подпапки:\n{pdf_dir}")
         try:
-            # Ищем все PDF-файлы во всех вложенных папках
             search_pattern = os.path.join(pdf_dir, '**', '*.pdf')
             pdf_files = glob.glob(search_pattern, recursive=True)
             
@@ -863,10 +870,9 @@ class MainApp(ctk.CTk):
 
             for pdf_path in pdf_files:
                 filename = os.path.basename(pdf_path)
-                current_dir = os.path.dirname(pdf_path) # Папка, где лежит именно этот PDF
+                current_dir = os.path.dirname(pdf_path) 
                 base_name = os.path.splitext(filename)[0]
                 
-                # Защита: пропускаем файлы, которые мы уже разрезали, чтобы не резать их по второму кругу
                 if base_name.endswith('_Мужские') or base_name.endswith('_Женские') or base_name.endswith('_Неопределенные') or base_name.startswith('All_Folder_'):
                     continue
 
@@ -896,7 +902,6 @@ class MainApp(ctk.CTk):
                         f_other += 1
                         total_other += 1
                         
-                # МАГИЯ ЗДЕСЬ: Сохраняем разделенные файлы прямо в ту же папку (current_dir)
                 if f_male > 0: file_male.save(os.path.join(current_dir, f"{base_name}_Мужские.pdf"))
                 if f_female > 0: file_female.save(os.path.join(current_dir, f"{base_name}_Женские.pdf"))
                 if f_other > 0: file_other.save(os.path.join(current_dir, f"{base_name}_Неопределенные.pdf"))
@@ -908,7 +913,6 @@ class MainApp(ctk.CTk):
                 file_other.close()
                 doc.close()
                 
-            # Общие сводные файлы (со всех папок разом) кладем в ту папку, что указана в "Куда сохранить"
             if total_male > 0:
                 master_male.save(os.path.join(out_dir, "All_Folder_Мужские.pdf"))
                 self.safe_log_split(f"\n[ОБЩИЙ ИТОГ] All_Folder_Мужские.pdf ({total_male} стр.) сохранен в папку вывода.")
