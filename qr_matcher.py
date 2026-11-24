@@ -7,6 +7,7 @@ import pandas as pd
 import fitz
 import threading
 import openpyxl
+import sqlite3
 from pypdf import PdfReader
 
 # Настройки внешнего вида
@@ -283,10 +284,29 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     log_callback(f"Уникальных КИЗов для вырезки из PDF: {total_kizs} шт.")
     log_callback("Начинаем сканирование и сортировку PDF-файлов...\n")
 
-    # 3. Сканируем PDF-файлы
+    # 3. Сканируем PDF-файлы (с SQLite-кэшированием текста страниц)
     pdf_files = glob.glob(os.path.join(pdf_dir, '*.pdf'))
     pdf_files = [f for f in pdf_files if not os.path.basename(f).startswith('Matched_') and not os.path.basename(f).startswith('All_Matched_')]
     
+    # Инициализация локального кэша SQLite
+    cache_conn = None
+    cache_cur = None
+    try:
+        cache_path = os.path.join(pdf_dir, ".pdf_kiz_cache.sqlite")
+        try:
+            cache_conn = sqlite3.connect(cache_path)
+        except Exception:
+            cache_path = os.path.join(output_dir, ".pdf_kiz_cache.sqlite")
+            cache_conn = sqlite3.connect(cache_path)
+        cache_cur = cache_conn.cursor()
+        cache_cur.execute("CREATE TABLE IF NOT EXISTS files (filename TEXT PRIMARY KEY, mtime REAL, size INTEGER)")
+        cache_cur.execute("CREATE TABLE IF NOT EXISTS pages (filename TEXT, page_num INTEGER, clean_text TEXT, gender TEXT, PRIMARY KEY (filename, page_num))")
+        cache_conn.commit()
+    except Exception as e:
+        log_callback(f"⚠️ Кэш отключен ({e}), работаем в обычном режиме.")
+        cache_conn = None
+        cache_cur = None
+
     doc_male = fitz.open()
     doc_female = fitz.open()
     doc_other = fitz.open()
@@ -295,25 +315,65 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
     female_count = 0
     other_count = 0
     
+    cached_hits = 0
+    indexed_new = 0
+    
     for i, pdf_path in enumerate(pdf_files):
+        if sum(len(v) for v in pdf_kiz_masks.values()) == 0:
+            break
+            
         filename = os.path.basename(pdf_path)
         progress_callback(i + 1, len(pdf_files), filename)
         
         try:
-            doc = fitz.open(pdf_path)
-            new_doc = fitz.open()
-            file_matched_count = 0
+            stat = os.stat(pdf_path)
+            f_mtime, f_size = stat.st_mtime, stat.st_size
             
-            for page_num in range(len(doc)):
+            pages_data = None
+            if cache_cur is not None:
+                cache_cur.execute("SELECT mtime, size FROM files WHERE filename = ?", (filename,))
+                row_meta = cache_cur.fetchone()
+                if row_meta and abs(row_meta[0] - f_mtime) < 1e-3 and row_meta[1] == f_size:
+                    cache_cur.execute("SELECT page_num, clean_text, gender FROM pages WHERE filename = ? ORDER BY page_num", (filename,))
+                    pages_data = cache_cur.fetchall()
+                    cached_hits += 1
+            
+            doc = None
+            if pages_data is None:
+                doc = fitz.open(pdf_path)
+                pages_data = []
+                file_lower = filename.lower()
+                for page_num in range(len(doc)):
+                    raw_text = doc[page_num].get_text()
+                    clean_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text).lower()
+                    text_lower = raw_text.lower()
+                    if 'женск' in text_lower or 'жен.' in text_lower or 'w-' in text_lower or 'женск' in file_lower:
+                        gender = 'female'
+                    elif 'мужск' in text_lower or 'муж.' in text_lower or 'мужск' in file_lower:
+                        gender = 'male'
+                    else:
+                        gender = 'other'
+                    pages_data.append((page_num, clean_text, gender))
+                
+                if cache_cur is not None:
+                    cache_cur.execute("DELETE FROM pages WHERE filename = ?", (filename,))
+                    cache_cur.executemany(
+                        "INSERT INTO pages (filename, page_num, clean_text, gender) VALUES (?, ?, ?, ?)",
+                        [(filename, pn, ct, g) for pn, ct, g in pages_data]
+                    )
+                    cache_cur.execute(
+                        "INSERT OR REPLACE INTO files (filename, mtime, size) VALUES (?, ?, ?)",
+                        (filename, f_mtime, f_size)
+                    )
+                    cache_conn.commit()
+                    indexed_new += 1
+
+            matched_pages = []
+            for page_num, clean_text, gender in pages_data:
                 if sum(len(v) for v in pdf_kiz_masks.values()) == 0:
-                    break 
+                    break
                     
-                page = doc[page_num]
-                raw_text = page.get_text()
-                clean_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text).lower()
-                
                 is_match = False
-                
                 for target_gtin, serials in pdf_kiz_masks.items():
                     if target_gtin.lower() in clean_text:
                         matched_serial_info = None
@@ -327,30 +387,38 @@ def process_full_workflow(scans_excel_path, direct_scans_text, pdf_dir, output_d
                             break
                             
                 if is_match:
+                    matched_pages.append((page_num, gender))
+            
+            if matched_pages:
+                if doc is None:
+                    doc = fitz.open(pdf_path)
+                new_doc = fitz.open()
+                for page_num, gender in matched_pages:
                     new_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                    text_lower = raw_text.lower()
-                    file_lower = filename.lower()
-                    if 'женск' in text_lower or 'жен.' in text_lower or 'w-' in text_lower or 'женск' in file_lower:
+                    if gender == 'female':
                         doc_female.insert_pdf(doc, from_page=page_num, to_page=page_num)
                         female_count += 1
-                    elif 'мужск' in text_lower or 'муж.' in text_lower or 'мужск' in file_lower:
+                    elif gender == 'male':
                         doc_male.insert_pdf(doc, from_page=page_num, to_page=page_num)
                         male_count += 1
                     else:
                         doc_other.insert_pdf(doc, from_page=page_num, to_page=page_num)
                         other_count += 1
-                    file_matched_count += 1
-                            
-            if file_matched_count > 0:
+                
                 output_filename = f'Matched_{filename}'
                 new_doc.save(os.path.join(output_dir, output_filename))
-                log_callback(f"Успех! Извлечено {file_matched_count} нужных стр. из файла {filename}")
+                log_callback(f"Успех! Извлечено {len(matched_pages)} нужных стр. из файла {filename}")
+                new_doc.close()
                 
-            new_doc.close()
-            doc.close()
+            if doc is not None:
+                doc.close()
                 
         except Exception as e:
             log_callback(f"Ошибка в файле {filename}: {e}")
+            
+    if cache_conn is not None:
+        cache_conn.close()
+        log_callback(f"[КЭШ PDF] Из кэша: {cached_hits} файл., проиндексировано новых: {indexed_new} файл.")
             
     if male_count > 0:
         doc_male.save(os.path.join(output_dir, "All_Matched_Мужские.pdf"))
@@ -496,7 +564,7 @@ def parse_orders_from_pdf(pdf_path: str) -> pd.DataFrame:
     orders = []
     products = []
     
-    regex_sku = r'((?:[A-Za-z]+[-_]?)?\d+(?:[-_][A-Za-z]+)?(?:[\s-]*\([^)]+\))?[\s_]+\d{2,3}(?:/\d{2,3})?(?:\s*\([^)]+\))?[-_]?|\b\d{5,10}\b)'
+    regex_sku = r'\b((?:[a-zA-Z]{1,2}[-_\s]*)?\d{2,5}[-_\s()a-zA-Z0-9]*_\d{2}(?:/\d{2,3})?(?:\s*\([a-zA-Z0-9]+\))?)(?![a-zA-Z0-9])'
     
     for i, line in enumerate(lines):
         line_clean = line
